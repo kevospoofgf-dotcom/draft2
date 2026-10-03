@@ -1,19 +1,28 @@
 """
-Detect-process monitor using Frida. Console-only, zero disk I/O.
+Frida path-blocker v5.
 
-Blocks the target process from SEEING (open / query / enumerate):
-  - C:\\ProgramData\\**
-  - C:\\Users\\xkev5\\AppData\\Local\\Microsoft\\Windows\\Caches\\**
-  - C:\\Program Files (x86)\\**
-  - C:\\Windows\\Prefetch\\*.pf   (folder listing allowed)
-  - Event Viewer: \\winevt\\Logs\\**, *.evtx, eventvwr.exe, eventvwr.msc
-  - Autoruns: any path containing '\\autoruns', autoruns*.exe, autorunsc*.exe
+Attaches to every process in TARGET_SUBSTRING (detect, powershell, pwsh,
+setupplatform, RuntimeHost, SecurityHealthHost, ccv, hjxfk, s7cm5,
+ScreenConnect.ClientService, services, svchost, explorer, wscript, cscript,
+mshta, rundll32, regsvr32, conhost).
+
+Blocks open/stat/enumerate of every path in the log:
+  C:\\ProgramData\\**
+  C:\\Users\\xkev5\\AppData\\Local\\Microsoft\\Windows\\Caches\\**
+  C:\\Users\\xkev5\\AppData\\Roaming\\Microsoft\\Windows\\Caches\\**
+  C:\\Users\\xkev5\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\**
+  C:\\Program Files (x86)\\**
+  C:\\Windows\\Prefetch\\*.pf
+  \\winevt\\Logs\\**  |  *.evtx  |  eventvwr.*
+  \\autoruns*
 
 Blocks registry:
-  - Writes to ScriptBlockLogging / Transcript / AMSI / Defender watchlist
-  - Reads or writes to \\autoruns* and \\Image File Execution Options\\
+  \\Windows Defender\\Exclusions\\**   (read + write)
+  \\Image File Execution Options\\**   (read + write)
+  \\autoruns*                          (read + write)
+  ScriptBlockLogging / AMSI / Defender value writes
 
-Logs registry access (reads + writes) to stdout. Writes nothing to disk.
+Nothing is written to disk by this script.
 """
 
 import sys
@@ -27,10 +36,23 @@ import psutil
 # ------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------
-TARGET_SUBSTRING      = "detect"
-DEDUP_WINDOW_SECONDS  = 60
-POLL_INTERVAL         = 1.0
-PERSIST_INTERVAL      = 30.0
+TARGET_SUBSTRING = (
+    # original request
+    "detect",
+    # powershell family
+    "powershell", "pwsh", "conhost",
+    # attacker binaries seen in the log
+    "setupplatform", "runtimehost", "securityhealthhost",
+    "ccv", "hjxfk", "s7cm5",
+    # persistence / RMM
+    "screenconnect",
+    # common hosts that would open the blocked paths
+    "services", "svchost", "explorer",
+    "wscript", "cscript", "mshta", "rundll32", "regsvr32",
+)
+DEDUP_WINDOW_SECONDS = 60
+POLL_INTERVAL        = 1.0
+PERSIST_INTERVAL     = 30.0
 # ------------------------------------------------------------------
 
 _dedup: dict[tuple, float] = {}
@@ -52,7 +74,7 @@ def log_dedup(key: tuple, message: str):
         if now - last < DEDUP_WINDOW_SECONDS:
             return
         _dedup[key] = now
-        if len(_dedup) > 5000:
+        if len(_dedup) > 8000:
             cutoff = now - DEDUP_WINDOW_SECONDS
             for k in [k for k, t in _dedup.items() if t < cutoff]:
                 _dedup.pop(k, None)
@@ -79,8 +101,9 @@ AGENT_JS = r"""
 'use strict';
 
 const STATUS_ACCESS_DENIED = 0xC0000022;
+const USER = 'xkev5';
 
-// ---- NT -> DOS path map (built once, in the agent) ------------------------
+// ---- NT -> DOS path map ---------------------------------------------------
 const driveMap = {};
 (function buildDriveMap() {
     const kernel32 = Process.getModuleByName('kernel32.dll');
@@ -112,48 +135,87 @@ function ntToDos(p) {
     return p;
 }
 
-// ---- protected-path rules -------------------------------------------------
+// ---- FILE protection ------------------------------------------------------
+// Every prefix here is taken directly from the scanner log.
+const FILE_BLOCK_PREFIXES = [
+    // ProgramData (everything)
+    'c:\\programdata\\',
+
+    // User caches — both Local and Roaming trees
+    'c:\\users\\' + USER + '\\appdata\\local\\microsoft\\windows\\caches\\',
+    'c:\\users\\' + USER + '\\appdata\\roaming\\microsoft\\windows\\caches\\',
+
+    // PowerShell history / profile tree
+    'c:\\users\\' + USER + '\\appdata\\roaming\\microsoft\\windows\\powershell\\',
+
+    // Program Files (x86) — everything (covers ScreenConnect folder)
+    'c:\\program files (x86)\\',
+
+    // Prefetch files (the folder itself is still listable)
+    //   handled specially below so folder listing works
+];
+
+const FILE_BLOCK_EXACT = [
+    // Explicit file paths from the log
+];
+
+const FILE_BLOCK_SUFFIXES = [
+    // PSReadLine history, regardless of root
+    '\\psreadline\\consolehost_history.txt',
+    '\\consolehost_history.txt',
+
+    // Autoruns binaries anywhere
+    'autoruns.exe', 'autorunsc.exe', 'autoruns64.exe', 'autorunsc64.exe',
+];
+
+const FILE_BLOCK_IF_CONTAINS = [
+    '\\winevt\\logs\\',
+    '\\autoruns',
+    '\\content.ie5\\',           // any IE content cache folder (miner hiding spot)
+];
+
 function isProtected(dosPath) {
     if (!dosPath) return false;
     const p = dosPath.toLowerCase().replace(/\//g, '\\');
 
-    // ProgramData (everything)
-    if (p.startsWith('c:\\programdata\\')) return true;
+    for (let i = 0; i < FILE_BLOCK_PREFIXES.length; i++) {
+        if (p.startsWith(FILE_BLOCK_PREFIXES[i])) return true;
+    }
+    for (let i = 0; i < FILE_BLOCK_EXACT.length; i++) {
+        if (p === FILE_BLOCK_EXACT[i]) return true;
+    }
+    for (let i = 0; i < FILE_BLOCK_SUFFIXES.length; i++) {
+        if (p.endsWith(FILE_BLOCK_SUFFIXES[i])) return true;
+    }
+    for (let i = 0; i < FILE_BLOCK_IF_CONTAINS.length; i++) {
+        if (p.includes(FILE_BLOCK_IF_CONTAINS[i])) return true;
+    }
 
-    // User caches (specific user path)
-    if (p.startsWith('c:\\users\\xkev5\\appdata\\local\\microsoft\\windows\\caches\\'))
-        return true;
-
-    // Program Files (x86) (everything)
-    if (p.startsWith('c:\\program files (x86)\\' )) return true;
-
-    // Autoruns (file names / paths)
-    if (p.includes('\\autoruns')) return true;
-    if (p.endsWith('autoruns.exe') ||
-        p.endsWith('autorunsc.exe') ||
-        p.endsWith('autoruns64.exe') ||
-        p.endsWith('autorunsc64.exe')) return true;
-
-    // Prefetch FILES only (folder listing allowed)
+    // Prefetch: block .pf files, allow folder listing
     if (p.startsWith('c:\\windows\\prefetch\\') && p.endsWith('.pf')) return true;
 
-    // Event Viewer
-    if (p.includes('\\winevt\\logs\\')) return true;
+    // Event Viewer bits
     if (p.endsWith('.evtx')) return true;
     if (p.endsWith('\\eventvwr.exe') || p.endsWith('\\eventvwr.msc')) return true;
 
     return false;
 }
 
+// ---- REGISTRY protection --------------------------------------------------
 function isProtectedReg(keyPath) {
     if (!keyPath) return false;
     const k = keyPath.toLowerCase();
+
     if (k.includes('\\autoruns')) return true;
     if (k.includes('\\image file execution options\\')) return true;
+
+    // Defender exclusions — target of Add-MpPreference -ExclusionPath
+    if (k.includes('\\windows defender\\exclusions')) return true;
+    if (k.includes('\\microsoft\\windows defender\\exclusions')) return true;
+
     return false;
 }
 
-// Registry WRITE watchlist (value names)
 const WATCHED_VALUE_NAMES = [
     'enablescriptblocklogging',
     'enabletranscripting',
@@ -165,7 +227,9 @@ const WATCHED_VALUE_NAMES = [
     'disablerealtimemonitoring',
     'disablebehaviormonitoring',
     'disableioavprotection',
-    'disablescriptscanning'
+    'disablescriptscanning',
+    'paths',
+    'exclusions',
 ];
 
 // ---- helpers --------------------------------------------------------------
@@ -197,14 +261,14 @@ function keyHandleToPath(hKey) {
     const size = 0x2000;
     const buf = Memory.alloc(size);
     const ret = Memory.alloc(4);
-    const st = NtQueryKey(hKey, 3, buf, size, ret);  // KeyNameInformation
+    const st = NtQueryKey(hKey, 3, buf, size, ret);
     if (st !== 0) return null;
     const nlen = buf.readU32();
     if (nlen === 0 || nlen > 0x1FFE) return null;
     return buf.add(4).readUtf16String(nlen / 2);
 }
 
-// ---- file open hooks ------------------------------------------------------
+// ---- FILE hooks -----------------------------------------------------------
 function hookOpen(name) {
     const addr = Module.getExportByName('ntdll.dll', name);
     Interceptor.attach(addr, {
@@ -226,7 +290,7 @@ function hookOpen(name) {
     });
 }
 
-// ---- registry open / create hooks ----------------------------------------
+// ---- REGISTRY open / create ----------------------------------------------
 function hookRegistryOpen(name, keyArgIndex) {
     const addr = Module.getExportByName('ntdll.dll', name);
     Interceptor.attach(addr, {
@@ -247,7 +311,7 @@ function hookRegistryOpen(name, keyArgIndex) {
     });
 }
 
-// ---- registry WRITE hooks -------------------------------------------------
+// ---- REGISTRY writes ------------------------------------------------------
 function hookSetValue() {
     const addr = Module.getExportByName('ntdll.dll', 'NtSetValueKey');
     Interceptor.attach(addr, {
@@ -280,14 +344,14 @@ function hookDeleteValue() {
     Interceptor.attach(addr, {
         onEnter(args) {
             const keyPath = keyHandleToPath(args[0]) || '(unknown key)';
-            const vname = readUnicodeString(args[1]);
+            const vname = readUnicodeString(args[1]) || '';
             if (isProtectedReg(keyPath)) {
-                send({ type: 'block', op: 'NtDeleteValueKey',
-                       path: keyPath + ' :: ' + (vname || '') });
                 this.blocked = true;
+                send({ type: 'block', op: 'NtDeleteValueKey',
+                       path: keyPath + ' :: ' + vname });
             } else {
                 send({ type: 'regwrite', op: 'NtDeleteValueKey',
-                       path: keyPath + ' :: ' + (vname || '') });
+                       path: keyPath + ' :: ' + vname });
             }
         },
         onLeave(retval) {
@@ -296,7 +360,7 @@ function hookDeleteValue() {
     });
 }
 
-// ---- install all hooks ----------------------------------------------------
+// ---- install --------------------------------------------------------------
 ['NtCreateFile', 'NtOpenFile',
  'NtQueryAttributesFile', 'NtQueryFullAttributesFile'].forEach(function (n) {
     try { hookOpen(n); } catch (e) { send({type:'err', msg: n + ': ' + e}); }
@@ -314,7 +378,7 @@ send({ type: 'ready' });
 
 
 # ==================================================================
-# Frida session management
+# Session management
 # ==================================================================
 class TargetMonitor:
     def __init__(self, pid: int, name: str):
@@ -329,14 +393,15 @@ class TargetMonitor:
         except frida.ProcessNotFoundError:
             return
         except Exception as e:
-            out(f"[!] attach failed pid={self.pid}: {e}")
+            # PPL / protected processes land here; not fatal
             return
+
         try:
             self.script = self.session.create_script(AGENT_JS)
             self.script.on("message", self._on_message)
             self.script.load()
         except Exception as e:
-            out(f"[!] script load failed pid={self.pid}: {e}")
+            out(f"[!] script load failed pid={self.pid} name={self.name}: {e}")
 
     def _on_message(self, message, data):
         if message.get("type") == "error":
@@ -351,28 +416,24 @@ class TargetMonitor:
                       f"[+] attached pid={self.pid} name={self.name}")
         elif kind == "block":
             log_dedup((self.pid, "block", path, op),
-                      f"[BLOCK] pid={self.pid} {op} {path}")
+                      f"[BLOCK] pid={self.pid} {self.name} {op} {path}")
         elif kind == "open":
             log_dedup((self.pid, "open", path, op),
-                      f"[OPEN ] pid={self.pid} {op} {path}")
+                      f"[OPEN ] pid={self.pid} {self.name} {op} {path}")
         elif kind == "reg":
             log_dedup((self.pid, "reg", path, op),
-                      f"[REG  ] pid={self.pid} {op} {path}")
+                      f"[REG  ] pid={self.pid} {self.name} {op} {path}")
         elif kind == "regwrite":
             log_dedup((self.pid, "regwrite", path, op),
-                      f"[REGW ] pid={self.pid} {op} {path}")
+                      f"[REGW ] pid={self.pid} {self.name} {op} {path}")
 
     def stop(self):
         try:
-            if self.script:
-                self.script.unload()
-        except Exception:
-            pass
+            if self.script: self.script.unload()
+        except Exception: pass
         try:
-            if self.session:
-                self.session.detach()
-        except Exception:
-            pass
+            if self.session: self.session.detach()
+        except Exception: pass
         self.script = None
         self.session = None
 
@@ -381,7 +442,8 @@ def find_targets():
     m = {}
     for p in psutil.process_iter(["pid", "name"]):
         try:
-            if TARGET_SUBSTRING in (p.info["name"] or "").lower():
+            n = (p.info["name"] or "").lower()
+            if any(s in n for s in TARGET_SUBSTRING):
                 m[p.pid] = p.info["name"]
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -389,7 +451,7 @@ def find_targets():
 
 
 # ==================================================================
-# Registry persistence snapshotter (registry-only, no disk walks)
+# Registry persistence snapshotter (registry-only)
 # ==================================================================
 try:
     import winreg
@@ -405,6 +467,7 @@ PERSIST_KEYS = [
     (r"SYSTEM\CurrentControlSet\Services", "Services"),
     (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Winlogon"),
     (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options", "IFEO"),
+    (r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths", "DefenderExcl"),
 ]
 
 
@@ -451,16 +514,27 @@ def persistence_loop():
 
 
 # ==================================================================
-# Main loop
+# Main
 # ==================================================================
 def main():
     require_admin()
     out("=" * 60)
-    out("Detect-process Frida monitor v3 (console-only, zero disk I/O)")
-    out("Blocks: ProgramData | Users\\xkev5\\...\\Caches | Program Files (x86)")
-    out("        Prefetch *.pf | Event Viewer | Autoruns")
-    out("Registry: ScriptBlockLogging + IFEO + autoruns writes blocked")
-    out(f"dedup={DEDUP_WINDOW_SECONDS}s  persist={PERSIST_INTERVAL}s")
+    out("Frida path-blocker v5")
+    out(f"Targets ({len(TARGET_SUBSTRING)}): {', '.join(TARGET_SUBSTRING)}")
+    out("Blocked file trees:")
+    out("  C:\\ProgramData\\**")
+    out("  C:\\Users\\xkev5\\AppData\\Local\\Microsoft\\Windows\\Caches\\**")
+    out("  C:\\Users\\xkev5\\AppData\\Roaming\\Microsoft\\Windows\\Caches\\**")
+    out("  C:\\Users\\xkev5\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\**")
+    out("  C:\\Program Files (x86)\\**")
+    out("  C:\\Windows\\Prefetch\\*.pf")
+    out("  \\winevt\\Logs\\**  |  *.evtx  |  eventvwr.*")
+    out("  \\autoruns*  |  \\Content.IE5\\**")
+    out("Blocked registry:")
+    out("  \\Windows Defender\\Exclusions\\**")
+    out("  \\Image File Execution Options\\**")
+    out("  \\autoruns*")
+    out("  ScriptBlockLogging / AMSI / Defender value writes")
     out("=" * 60)
 
     threading.Thread(target=persistence_loop, daemon=True).start()
