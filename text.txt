@@ -1,0 +1,339 @@
+"""
+Detect-process monitor using Frida. Console-only, no disk writes.
+
+- Attaches to every process whose name contains 'detect'.
+- Hooks NtCreateFile / NtOpenFile / NtOpenKey / NtCreateKey to log every
+  path touched (stdout only).
+- Blocks reads of:
+    * C:\\Windows\\Prefetch\\*.pf  (the folder itself is still listable)
+    * Event Viewer files (.evtx, winevt\\Logs, eventvwr.exe/msc)
+    * Anything under ProgramData
+    * Autoruns files / folders
+    * Autoruns / Image-File-Execution-Options registry keys
+- No files are ever written to disk by this script.
+"""
+
+import sys
+import time
+import ctypes
+import threading
+
+import frida
+import psutil
+
+# ------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------
+TARGET_SUBSTRING      = "detect"
+DEDUP_WINDOW_SECONDS  = 60       # in-memory suppression window
+POLL_INTERVAL         = 1.0      # seconds between process scans
+# ------------------------------------------------------------------
+
+# In-memory dedup cache: key -> last_logged_epoch
+_dedup: dict[tuple, float] = {}
+_dedup_lock = threading.Lock()
+
+
+def out(msg: str):
+    """Write a single line to stdout. Never touches disk."""
+    try:
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def log_dedup(key: tuple, message: str):
+    now = time.time()
+    with _dedup_lock:
+        last = _dedup.get(key, 0)
+        if now - last < DEDUP_WINDOW_SECONDS:
+            return
+        _dedup[key] = now
+        if len(_dedup) > 5000:
+            cutoff = now - DEDUP_WINDOW_SECONDS
+            for k in [k for k, t in _dedup.items() if t < cutoff]:
+                _dedup.pop(k, None)
+    out(message)
+
+
+def is_admin() -> bool:
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def require_admin():
+    if not is_admin():
+        sys.stderr.write("ERROR: run as Administrator.\n")
+        sys.exit(1)
+
+
+# ------------------------------------------------------------------
+# Frida agent source (JS)
+# ------------------------------------------------------------------
+AGENT_JS = r"""
+'use strict';
+
+const STATUS_ACCESS_DENIED = 0xC0000022;
+
+// ---- NT -> DOS path map ---------------------------------------------------
+const driveMap = {};
+(function buildDriveMap() {
+    const kernel32 = Process.getModuleByName('kernel32.dll');
+    const GetLogicalDriveStringsW = new NativeFunction(
+        kernel32.getExportByName('GetLogicalDriveStringsW'),
+        'uint32', ['uint32', 'pointer']);
+    const QueryDosDeviceW = new NativeFunction(
+        kernel32.getExportByName('QueryDosDeviceW'),
+        'uint32', ['pointer', 'pointer', 'uint32']);
+
+    const buf = Memory.alloc(1024);
+    const n = GetLogicalDriveStringsW(512, buf);
+    if (n > 0) {
+        const s = buf.readUtf16String(n);
+        s.split('\x00').filter(Boolean).forEach(function (drive) {
+            const letter = drive.replace(/\\+$/, '');
+            const tgt = Memory.alloc(1024);
+            if (QueryDosDeviceW(Memory.allocUtf16String(letter), tgt, 512) > 0) {
+                driveMap[tgt.readUtf16String()] = letter;
+            }
+        });
+    }
+})();
+
+function ntToDos(p) {
+    if (!p) return p;
+    for (const nt in driveMap) {
+        if (p.startsWith(nt)) return driveMap[nt] + p.substring(nt.length);
+    }
+    return p;
+}
+
+// ---- protected-path rules -------------------------------------------------
+function isProtected(dosPath) {
+    if (!dosPath) return false;
+    const p = dosPath.toLowerCase().replace(/\//g, '\\');
+
+    // Prefetch FILES only (folder listing still allowed)
+    if (p.startsWith('c:\\windows\\prefetch\\') && p.endsWith('.pf')) return true;
+
+    // Event Viewer
+    if (p.includes('\\winevt\\logs\\')) return true;
+    if (p.endsWith('.evtx')) return true;
+    if (p.endsWith('\\eventvwr.exe') || p.endsWith('\\eventvwr.msc')) return true;
+
+    // ProgramData (everything)
+    if (p.startsWith('c:\\programdata\\')) return true;
+
+    // Autoruns files / folders
+    if (p.includes('\\autoruns')) return true;
+    if (p.endsWith('autoruns.exe') ||
+        p.endsWith('autorunsc.exe') ||
+        p.endsWith('autoruns64.exe') ||
+        p.endsWith('autorunsc64.exe')) return true;
+
+    return false;
+}
+
+function isProtectedReg(keyPath) {
+    if (!keyPath) return false;
+    const k = keyPath.toLowerCase();
+    if (k.includes('\\autoruns')) return true;
+    if (k.includes('\\image file execution options\\')) return true;
+    return false;
+}
+
+// ---- helpers --------------------------------------------------------------
+function readUnicodeString(ptr) {
+    if (ptr.isNull()) return null;
+    try {
+        const len = ptr.readU16();
+        if (len === 0 || len > 0x8000) return null;
+        const buf = ptr.add(8).readPointer();
+        if (buf.isNull()) return null;
+        return buf.readUtf16String(len / 2);
+    } catch (e) { return null; }
+}
+
+function readObjectAttributes(oaPtr) {
+    if (oaPtr.isNull()) return null;
+    try {
+        const namePtr = oaPtr.add(0x10).readPointer();
+        return readUnicodeString(namePtr);
+    } catch (e) { return null; }
+}
+
+function hookOpen(name) {
+    const addr = Module.getExportByName('ntdll.dll', name);
+    Interceptor.attach(addr, {
+        onEnter(args) {
+            this.blocked = false;
+            this.path = null;
+            const ntPath = readObjectAttributes(args[2]);
+            if (!ntPath) return;
+            const dos = ntToDos(ntPath);
+            this.path = dos;
+            if (isProtected(dos)) {
+                this.blocked = true;
+                send({ type: 'block', op: name, path: dos });
+            } else {
+                send({ type: 'open', op: name, path: dos });
+            }
+        },
+        onLeave(retval) {
+            if (this.blocked) retval.replace(ptr(STATUS_ACCESS_DENIED));
+        }
+    });
+}
+
+function hookRegistry(name, keyArgIndex) {
+    const addr = Module.getExportByName('ntdll.dll', name);
+    Interceptor.attach(addr, {
+        onEnter(args) {
+            this.blocked = false;
+            const ntPath = readObjectAttributes(args[keyArgIndex]);
+            if (!ntPath) return;
+            if (isProtectedReg(ntPath)) {
+                this.blocked = true;
+                send({ type: 'block', op: name, path: ntPath });
+            } else {
+                send({ type: 'reg', op: name, path: ntPath });
+            }
+        },
+        onLeave(retval) {
+            if (this.blocked) retval.replace(ptr(STATUS_ACCESS_DENIED));
+        }
+    });
+}
+
+['NtCreateFile', 'NtOpenFile',
+ 'NtQueryAttributesFile', 'NtQueryFullAttributesFile'].forEach(function (n) {
+    try { hookOpen(n); } catch (e) { send({type:'err', msg: n + ': ' + e}); }
+});
+
+try { hookRegistry('NtOpenKey', 0); } catch (e) {}
+try { hookRegistry('NtOpenKeyEx', 1); } catch (e) {}
+try { hookRegistry('NtCreateKey', 2); } catch (e) {}
+
+send({ type: 'ready' });
+"""
+
+
+# ------------------------------------------------------------------
+# Frida session management
+# ------------------------------------------------------------------
+class TargetMonitor:
+    def __init__(self, pid: int, name: str):
+        self.pid = pid
+        self.name = name
+        self.session = None
+        self.script = None
+
+    def start(self):
+        try:
+            self.session = frida.attach(self.pid)
+        except frida.ProcessNotFoundError:
+            return
+        except Exception as e:
+            out(f"[!] attach failed pid={self.pid}: {e}")
+            return
+
+        try:
+            self.script = self.session.create_script(AGENT_JS)
+            self.script.on("message", self._on_message)
+            self.script.load()
+        except Exception as e:
+            out(f"[!] script load failed pid={self.pid}: {e}")
+
+    def _on_message(self, message, data):
+        if message.get("type") == "error":
+            return
+        payload = message.get("payload") or {}
+        kind = payload.get("type")
+        path = payload.get("path", "")
+        op = payload.get("op", "")
+
+        if kind == "ready":
+            log_dedup((self.pid, "ready"),
+                      f"[+] attached pid={self.pid} name={self.name}")
+        elif kind == "block":
+            log_dedup((self.pid, "block", path, op),
+                      f"[BLOCK] pid={self.pid} {op} {path}")
+        elif kind == "open":
+            log_dedup((self.pid, "open", path, op),
+                      f"[OPEN ] pid={self.pid} {op} {path}")
+        elif kind == "reg":
+            log_dedup((self.pid, "reg", path, op),
+                      f"[REG  ] pid={self.pid} {op} {path}")
+
+    def stop(self):
+        try:
+            if self.script:
+                self.script.unload()
+        except Exception:
+            pass
+        try:
+            if self.session:
+                self.session.detach()
+        except Exception:
+            pass
+        self.script = None
+        self.session = None
+
+
+# ------------------------------------------------------------------
+# Main loop
+# ------------------------------------------------------------------
+def find_targets():
+    out_map = {}
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            if TARGET_SUBSTRING in (p.info["name"] or "").lower():
+                out_map[p.pid] = p.info["name"]
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return out_map
+
+
+def main():
+    require_admin()
+    out("=" * 60)
+    out("Detect-process Frida monitor (console only, no disk writes)")
+    out(f"dedup window = {DEDUP_WINDOW_SECONDS}s")
+    out("=" * 60)
+
+    monitors: dict[int, TargetMonitor] = {}
+
+    while True:
+        try:
+            current = find_targets()
+
+            for pid, name in current.items():
+                if pid not in monitors:
+                    m = TargetMonitor(pid, name)
+                    m.start()
+                    monitors[pid] = m
+
+            for pid in list(monitors.keys()):
+                if pid not in current:
+                    monitors.pop(pid).stop()
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            out(f"[!] loop error: {e}")
+
+        time.sleep(POLL_INTERVAL)
+
+    for m in monitors.values():
+        m.stop()
+    out("stopped.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
