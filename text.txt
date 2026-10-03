@@ -1,16 +1,19 @@
 """
-Detect-process monitor using Frida. Console-only, no disk writes.
+Detect-process monitor using Frida. Console-only, zero disk I/O.
 
-- Attaches to every process whose name contains 'detect'.
-- Hooks NtCreateFile / NtOpenFile / NtOpenKey / NtCreateKey to log every
-  path touched (stdout only).
-- Blocks reads of:
-    * C:\\Windows\\Prefetch\\*.pf  (the folder itself is still listable)
-    * Event Viewer files (.evtx, winevt\\Logs, eventvwr.exe/msc)
-    * Anything under ProgramData
-    * Autoruns files / folders
-    * Autoruns / Image-File-Execution-Options registry keys
-- No files are ever written to disk by this script.
+Blocks the target process from SEEING (open / query / enumerate):
+  - C:\\ProgramData\\**
+  - C:\\Users\\xkev5\\AppData\\Local\\Microsoft\\Windows\\Caches\\**
+  - C:\\Program Files (x86)\\**
+  - C:\\Windows\\Prefetch\\*.pf   (folder listing allowed)
+  - Event Viewer: \\winevt\\Logs\\**, *.evtx, eventvwr.exe, eventvwr.msc
+  - Autoruns: any path containing '\\autoruns', autoruns*.exe, autorunsc*.exe
+
+Blocks registry:
+  - Writes to ScriptBlockLogging / Transcript / AMSI / Defender watchlist
+  - Reads or writes to \\autoruns* and \\Image File Execution Options\\
+
+Logs registry access (reads + writes) to stdout. Writes nothing to disk.
 """
 
 import sys
@@ -25,17 +28,16 @@ import psutil
 # Configuration
 # ------------------------------------------------------------------
 TARGET_SUBSTRING      = "detect"
-DEDUP_WINDOW_SECONDS  = 60       # in-memory suppression window
-POLL_INTERVAL         = 1.0      # seconds between process scans
+DEDUP_WINDOW_SECONDS  = 60
+POLL_INTERVAL         = 1.0
+PERSIST_INTERVAL      = 30.0
 # ------------------------------------------------------------------
 
-# In-memory dedup cache: key -> last_logged_epoch
 _dedup: dict[tuple, float] = {}
 _dedup_lock = threading.Lock()
 
 
 def out(msg: str):
-    """Write a single line to stdout. Never touches disk."""
     try:
         sys.stdout.write(msg + "\n")
         sys.stdout.flush()
@@ -70,15 +72,15 @@ def require_admin():
         sys.exit(1)
 
 
-# ------------------------------------------------------------------
-# Frida agent source (JS)
-# ------------------------------------------------------------------
+# ==================================================================
+# Frida agent
+# ==================================================================
 AGENT_JS = r"""
 'use strict';
 
 const STATUS_ACCESS_DENIED = 0xC0000022;
 
-// ---- NT -> DOS path map ---------------------------------------------------
+// ---- NT -> DOS path map (built once, in the agent) ------------------------
 const driveMap = {};
 (function buildDriveMap() {
     const kernel32 = Process.getModuleByName('kernel32.dll');
@@ -88,7 +90,6 @@ const driveMap = {};
     const QueryDosDeviceW = new NativeFunction(
         kernel32.getExportByName('QueryDosDeviceW'),
         'uint32', ['pointer', 'pointer', 'uint32']);
-
     const buf = Memory.alloc(1024);
     const n = GetLogicalDriveStringsW(512, buf);
     if (n > 0) {
@@ -116,23 +117,30 @@ function isProtected(dosPath) {
     if (!dosPath) return false;
     const p = dosPath.toLowerCase().replace(/\//g, '\\');
 
-    // Prefetch FILES only (folder listing still allowed)
+    // ProgramData (everything)
+    if (p.startsWith('c:\\programdata\\')) return true;
+
+    // User caches (specific user path)
+    if (p.startsWith('c:\\users\\xkev5\\appdata\\local\\microsoft\\windows\\caches\\'))
+        return true;
+
+    // Program Files (x86) (everything)
+    if (p.startsWith('c:\\program files (x86)\\' )) return true;
+
+    // Autoruns (file names / paths)
+    if (p.includes('\\autoruns')) return true;
+    if (p.endsWith('autoruns.exe') ||
+        p.endsWith('autorunsc.exe') ||
+        p.endsWith('autoruns64.exe') ||
+        p.endsWith('autorunsc64.exe')) return true;
+
+    // Prefetch FILES only (folder listing allowed)
     if (p.startsWith('c:\\windows\\prefetch\\') && p.endsWith('.pf')) return true;
 
     // Event Viewer
     if (p.includes('\\winevt\\logs\\')) return true;
     if (p.endsWith('.evtx')) return true;
     if (p.endsWith('\\eventvwr.exe') || p.endsWith('\\eventvwr.msc')) return true;
-
-    // ProgramData (everything)
-    if (p.startsWith('c:\\programdata\\')) return true;
-
-    // Autoruns files / folders
-    if (p.includes('\\autoruns')) return true;
-    if (p.endsWith('autoruns.exe') ||
-        p.endsWith('autorunsc.exe') ||
-        p.endsWith('autoruns64.exe') ||
-        p.endsWith('autorunsc64.exe')) return true;
 
     return false;
 }
@@ -145,13 +153,28 @@ function isProtectedReg(keyPath) {
     return false;
 }
 
+// Registry WRITE watchlist (value names)
+const WATCHED_VALUE_NAMES = [
+    'enablescriptblocklogging',
+    'enabletranscripting',
+    'enablemodulelog',
+    'enableinvocationheader',
+    'enablecmdlineauditing',
+    'enablescriptblockinvocationlogging',
+    'disableantispyware',
+    'disablerealtimemonitoring',
+    'disablebehaviormonitoring',
+    'disableioavprotection',
+    'disablescriptscanning'
+];
+
 // ---- helpers --------------------------------------------------------------
-function readUnicodeString(ptr) {
-    if (ptr.isNull()) return null;
+function readUnicodeString(p) {
+    if (p.isNull()) return null;
     try {
-        const len = ptr.readU16();
+        const len = p.readU16();
         if (len === 0 || len > 0x8000) return null;
-        const buf = ptr.add(8).readPointer();
+        const buf = p.add(8).readPointer();
         if (buf.isNull()) return null;
         return buf.readUtf16String(len / 2);
     } catch (e) { return null; }
@@ -160,21 +183,36 @@ function readUnicodeString(ptr) {
 function readObjectAttributes(oaPtr) {
     if (oaPtr.isNull()) return null;
     try {
-        const namePtr = oaPtr.add(0x10).readPointer();
-        return readUnicodeString(namePtr);
+        return readUnicodeString(oaPtr.add(0x10).readPointer());
     } catch (e) { return null; }
 }
 
+const ntdll = Process.getModuleByName('ntdll.dll');
+const NtQueryKey = new NativeFunction(
+    ntdll.getExportByName('NtQueryKey'),
+    'int', ['pointer', 'int', 'pointer', 'uint32', 'pointer']);
+
+function keyHandleToPath(hKey) {
+    if (hKey.isNull()) return null;
+    const size = 0x2000;
+    const buf = Memory.alloc(size);
+    const ret = Memory.alloc(4);
+    const st = NtQueryKey(hKey, 3, buf, size, ret);  // KeyNameInformation
+    if (st !== 0) return null;
+    const nlen = buf.readU32();
+    if (nlen === 0 || nlen > 0x1FFE) return null;
+    return buf.add(4).readUtf16String(nlen / 2);
+}
+
+// ---- file open hooks ------------------------------------------------------
 function hookOpen(name) {
     const addr = Module.getExportByName('ntdll.dll', name);
     Interceptor.attach(addr, {
         onEnter(args) {
             this.blocked = false;
-            this.path = null;
             const ntPath = readObjectAttributes(args[2]);
             if (!ntPath) return;
             const dos = ntToDos(ntPath);
-            this.path = dos;
             if (isProtected(dos)) {
                 this.blocked = true;
                 send({ type: 'block', op: name, path: dos });
@@ -188,7 +226,8 @@ function hookOpen(name) {
     });
 }
 
-function hookRegistry(name, keyArgIndex) {
+// ---- registry open / create hooks ----------------------------------------
+function hookRegistryOpen(name, keyArgIndex) {
     const addr = Module.getExportByName('ntdll.dll', name);
     Interceptor.attach(addr, {
         onEnter(args) {
@@ -208,22 +247,75 @@ function hookRegistry(name, keyArgIndex) {
     });
 }
 
+// ---- registry WRITE hooks -------------------------------------------------
+function hookSetValue() {
+    const addr = Module.getExportByName('ntdll.dll', 'NtSetValueKey');
+    Interceptor.attach(addr, {
+        onEnter(args) {
+            this.blocked = false;
+            const hKey = args[0];
+            const vname = readUnicodeString(args[1]);
+            if (!vname) return;
+            const keyPath = keyHandleToPath(hKey) || '(unknown key)';
+            const v = vname.toLowerCase();
+            const badValue = WATCHED_VALUE_NAMES.some(w => v === w || v.includes(w));
+            const badKey = isProtectedReg(keyPath);
+            if (badValue || badKey) {
+                this.blocked = true;
+                send({ type: 'block', op: 'NtSetValueKey',
+                       path: keyPath + ' :: ' + vname });
+            } else {
+                send({ type: 'regwrite', op: 'NtSetValueKey',
+                       path: keyPath + ' :: ' + vname });
+            }
+        },
+        onLeave(retval) {
+            if (this.blocked) retval.replace(ptr(STATUS_ACCESS_DENIED));
+        }
+    });
+}
+
+function hookDeleteValue() {
+    const addr = Module.getExportByName('ntdll.dll', 'NtDeleteValueKey');
+    Interceptor.attach(addr, {
+        onEnter(args) {
+            const keyPath = keyHandleToPath(args[0]) || '(unknown key)';
+            const vname = readUnicodeString(args[1]);
+            if (isProtectedReg(keyPath)) {
+                send({ type: 'block', op: 'NtDeleteValueKey',
+                       path: keyPath + ' :: ' + (vname || '') });
+                this.blocked = true;
+            } else {
+                send({ type: 'regwrite', op: 'NtDeleteValueKey',
+                       path: keyPath + ' :: ' + (vname || '') });
+            }
+        },
+        onLeave(retval) {
+            if (this.blocked) retval.replace(ptr(STATUS_ACCESS_DENIED));
+        }
+    });
+}
+
+// ---- install all hooks ----------------------------------------------------
 ['NtCreateFile', 'NtOpenFile',
  'NtQueryAttributesFile', 'NtQueryFullAttributesFile'].forEach(function (n) {
     try { hookOpen(n); } catch (e) { send({type:'err', msg: n + ': ' + e}); }
 });
 
-try { hookRegistry('NtOpenKey', 0); } catch (e) {}
-try { hookRegistry('NtOpenKeyEx', 1); } catch (e) {}
-try { hookRegistry('NtCreateKey', 2); } catch (e) {}
+try { hookRegistryOpen('NtOpenKey', 0); } catch (e) {}
+try { hookRegistryOpen('NtOpenKeyEx', 1); } catch (e) {}
+try { hookRegistryOpen('NtCreateKey', 2); } catch (e) {}
+
+try { hookSetValue(); } catch (e) {}
+try { hookDeleteValue(); } catch (e) {}
 
 send({ type: 'ready' });
 """
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Frida session management
-# ------------------------------------------------------------------
+# ==================================================================
 class TargetMonitor:
     def __init__(self, pid: int, name: str):
         self.pid = pid
@@ -239,7 +331,6 @@ class TargetMonitor:
         except Exception as e:
             out(f"[!] attach failed pid={self.pid}: {e}")
             return
-
         try:
             self.script = self.session.create_script(AGENT_JS)
             self.script.on("message", self._on_message)
@@ -267,6 +358,9 @@ class TargetMonitor:
         elif kind == "reg":
             log_dedup((self.pid, "reg", path, op),
                       f"[REG  ] pid={self.pid} {op} {path}")
+        elif kind == "regwrite":
+            log_dedup((self.pid, "regwrite", path, op),
+                      f"[REGW ] pid={self.pid} {op} {path}")
 
     def stop(self):
         try:
@@ -283,48 +377,110 @@ class TargetMonitor:
         self.session = None
 
 
-# ------------------------------------------------------------------
-# Main loop
-# ------------------------------------------------------------------
 def find_targets():
-    out_map = {}
+    m = {}
     for p in psutil.process_iter(["pid", "name"]):
         try:
             if TARGET_SUBSTRING in (p.info["name"] or "").lower():
-                out_map[p.pid] = p.info["name"]
+                m[p.pid] = p.info["name"]
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return out_map
+    return m
 
 
+# ==================================================================
+# Registry persistence snapshotter (registry-only, no disk walks)
+# ==================================================================
+try:
+    import winreg
+    HAVE_WINREG = True
+except ImportError:
+    HAVE_WINREG = False
+
+PERSIST_KEYS = [
+    (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "Run"),
+    (r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "RunOnce"),
+    (r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run", "RunWOW"),
+    (r"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce", "RunOnceWOW"),
+    (r"SYSTEM\CurrentControlSet\Services", "Services"),
+    (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Winlogon"),
+    (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options", "IFEO"),
+]
+
+
+def snapshot_registry():
+    snap = {}
+    if not HAVE_WINREG:
+        return snap
+    for key, label in PERSIST_KEYS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key,
+                                0, winreg.KEY_READ) as k:
+                i = 0
+                while True:
+                    try:
+                        name, val, _ = winreg.EnumValue(k, i)
+                        snap[f"{label}\\{name}"] = str(val)[:200]
+                        i += 1
+                    except OSError:
+                        break
+        except OSError:
+            continue
+    return snap
+
+
+def persistence_loop():
+    prev = None
+    while True:
+        try:
+            cur = snapshot_registry()
+            if prev is None:
+                out(f"[PERSIST] baseline captured ({len(cur)} entries)")
+            else:
+                for k in cur.keys() - prev.keys():
+                    out(f"[PERSIST-NEW] {k} -> {cur[k]}")
+                for k in prev.keys() - cur.keys():
+                    out(f"[PERSIST-DEL] {k}")
+                for k in cur.keys() & prev.keys():
+                    if cur[k] != prev[k]:
+                        out(f"[PERSIST-MOD] {k}: {prev[k]} -> {cur[k]}")
+            prev = cur
+        except Exception as e:
+            out(f"[!] persistence error: {e}")
+        time.sleep(PERSIST_INTERVAL)
+
+
+# ==================================================================
+# Main loop
+# ==================================================================
 def main():
     require_admin()
     out("=" * 60)
-    out("Detect-process Frida monitor (console only, no disk writes)")
-    out(f"dedup window = {DEDUP_WINDOW_SECONDS}s")
+    out("Detect-process Frida monitor v3 (console-only, zero disk I/O)")
+    out("Blocks: ProgramData | Users\\xkev5\\...\\Caches | Program Files (x86)")
+    out("        Prefetch *.pf | Event Viewer | Autoruns")
+    out("Registry: ScriptBlockLogging + IFEO + autoruns writes blocked")
+    out(f"dedup={DEDUP_WINDOW_SECONDS}s  persist={PERSIST_INTERVAL}s")
     out("=" * 60)
 
-    monitors: dict[int, TargetMonitor] = {}
+    threading.Thread(target=persistence_loop, daemon=True).start()
 
+    monitors: dict[int, TargetMonitor] = {}
     while True:
         try:
             current = find_targets()
-
             for pid, name in current.items():
                 if pid not in monitors:
                     m = TargetMonitor(pid, name)
                     m.start()
                     monitors[pid] = m
-
             for pid in list(monitors.keys()):
                 if pid not in current:
                     monitors.pop(pid).stop()
-
         except KeyboardInterrupt:
             break
         except Exception as e:
             out(f"[!] loop error: {e}")
-
         time.sleep(POLL_INTERVAL)
 
     for m in monitors.values():
