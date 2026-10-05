@@ -74,6 +74,13 @@ BLOCKED_EXE_NAMES = [
     # "runtimehost.exe",
     # "securityhealthhost.exe",
     # "winring0x64.sys",
+    # "jhgu.exe",
+    # "detect-fm-91215616.exe",
+    # "detect-fm-08819122.exe",
+    # "detect-fm-33190709.exe",
+    # "Journal.exe",
+    # "utilman.exe",
+    # "cmd.exe",
 ]
 
 # ----------------------------------------------------------------
