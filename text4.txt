@@ -1,0 +1,1545 @@
+r"""Block personal-data access via Frida (companion to nefd.py detector).
+
+Merged revision + boot/EFI layer lock + named-exe interceptor + Download-folder
+masking + fabricated "present" files:
+
+  - USN journal fabrication REMOVED.
+  - Merged blocklist: ProgramData, per-user Caches trees, Program Files (x86),
+    Content.IE5, PowerShell profile tree, plus named miner/dropper artifacts.
+  - ScriptBlockLogging / ModuleLogging / Transcription registry paths blocked
+    on BOTH open/query and write, plus value-name watchlist.
+  - BCD store files blocked (C:\Boot\BCD, C:\EFI\...\BCD, bootmgr, bootmgfw.efi).
+  - UEFI NVRAM variable queries blocked.
+  - Firmware table enumeration blocked.
+  - Boot-related Event Log channels blocked.
+  - bcdedit / bcdboot child process creation blocked.
+  - BLOCKED_EXE_NAMES: substring block on every filesystem and registry API.
+  - Downloads folder: entire C:\Users\xkev5\Downloads\ tree is blocked.
+  - FABRICATED_PRESENT_FILES: when the scanner stats/opens one of these paths,
+    the hook returns a plausible "present" response instead of ACCESS_DENIED
+    or NAME_NOT_FOUND. This stops the "Downloaded/Saved File Missing" alerts.
+  - No admin required. Nothing is written to disk.
+"""
+import frida
+import sys
+import time
+import os
+import json
+import threading
+import queue
+import psutil
+import ctypes
+
+# =====================================================================
+# CONFIG
+# =====================================================================
+
+SUBSTR = "detect"
+
+ATTACH_EXCLUDE_SUBSTR = [
+    "autodetecd",
+    "autodetec",
+    "automodedetect",
+    "automodedetec",
+    "automodedetct",
+]
+
+BLOCK_EVENTLOG         = True
+BLOCK_PREFETCH         = True
+BLOCK_DATAUSAGE        = True
+BLOCK_REGISTRY         = True
+STRICT_REGISTRY        = False
+BLOCK_AUTORUN          = True
+BLOCK_HISTORY          = True
+BLOCK_ELEVATED_LOGS    = True
+BLOCK_DNSCACHE_DPS     = True
+BLOCK_SECURITY_USN     = False
+BLOCK_USB              = True
+BLOCK_BROWSER_HISTORY  = True
+BLOCK_TASKS_COM        = True
+BLOCK_WMI              = True
+BLOCK_EFI              = True
+
+USER_NAME = "xkev5"
+
+# ----------------------------------------------------------------
+# Named executables to intercept everywhere.
+# ----------------------------------------------------------------
+BLOCKED_EXE_NAMES = [
+    "setupplatform.exe",
+    # "ccv.exe",
+    # "hjxfk.exe",
+    # "s7cm5.exe",
+    # "runtimehost.exe",
+    # "securityhealthhost.exe",
+    # "winring0x64.sys",
+]
+
+# ----------------------------------------------------------------
+# Files that should be reported as PRESENT, not missing.
+# When the scanner stats/opens these exact paths, they will receive
+# a success response with a plausible size and modified time, and a
+# readable handle if they open the file.
+# ----------------------------------------------------------------
+FABRICATED_PRESENT_FILES = [
+    r"c:\users\xkev5\detect-fm-33190709.exe",
+    r"c:\users\xkev5\detect-fm-08819122.exe",
+    r"c:\users\xkev5\detect-fm-91215616.exe",
+    r"c:\users\xkev5\documents\jhgu.exe",
+]
+
+# Fake metadata for the fabricated files.
+FABRICATED_FILE_SIZE = 24576      # 24 KB — plausible small exe
+FABRICATED_MTIME_UNIX = 1759680000  # ~2025-10-05
+
+# ----------------------------------------------------------------
+# File blocklists
+# ----------------------------------------------------------------
+MERGED_FILE_PREFIXES = [
+    "c:\\programdata\\",
+    "c:\\users\\" + USER_NAME + "\\appdata\\local\\microsoft\\windows\\caches\\",
+    "c:\\users\\" + USER_NAME + "\\appdata\\roaming\\microsoft\\windows\\caches\\",
+    "c:\\users\\" + USER_NAME + "\\appdata\\roaming\\microsoft\\windows\\powershell\\",
+    "c:\\program files (x86)\\",
+    # ---- NEW: whole Downloads tree blocked ----
+    "c:\\users\\" + USER_NAME + "\\downloads\\",
+]
+
+MERGED_FILE_EXACT = [
+    "c:\\boot\\bcd",
+    "c:\\boot\\bcd.log",
+    "c:\\boot\\bcd.log1",
+    "c:\\boot\\bcd.log2",
+    "c:\\efi\\microsoft\\boot\\bcd",
+    "c:\\efi\\microsoft\\boot\\bcd.log",
+    "c:\\efi\\microsoft\\boot\\bcd.log1",
+    "c:\\efi\\microsoft\\boot\\bcd.log2",
+    "c:\\efi\\microsoft\\boot\\bootmgfw.efi",
+    "c:\\efi\\microsoft\\boot\\bootmgfw.efi.old",
+    "c:\\efi\\boot\\bootx64.efi",
+    "c:\\efi\\boot\\bootx64.efi.old",
+    "c:\\bootmgr",
+    "c:\\bootnxt",
+    "c:\\bootstat.dat",
+]
+
+BCD_EFI_PREFIXES = [
+    "c:\\efi\\microsoft\\boot\\",
+    "c:\\efi\\boot\\",
+    "c:\\boot\\",
+]
+
+MERGED_FILE_SUFFIXES = [
+    "\\psreadline\\consolehost_history.txt",
+    "\\consolehost_history.txt",
+    "\\bcd",
+    "\\bcd.log",
+    "\\bcd.log1",
+    "\\bcd.log2",
+    "\\bootmgfw.efi",
+    "\\bootmgfw.efi.old",
+    "\\bootx64.efi",
+    "\\bootx64.efi.old",
+    "\\bootmgr",
+    "\\bootnxt",
+]
+
+MERGED_FILE_CONTAINS = [
+    "\\content.ie5\\",
+    "\\autoruns",
+]
+
+MERGED_ARTIFACT_NAMES = [
+    "ccv.exe",
+    "hjxfk.exe",
+    "s7cm5.exe",
+    "winring0x64.sys",
+    "winring0.sys",
+    "runtimehost.exe",
+    "securityhealthhost.exe",
+]
+
+HIDDEN_NAMES = [
+    "detect.log",
+    "detect-fm.log",
+    "detect-fm-37713147.exe",
+    "consolehost_history.txt",
+    "setupapi.dev.log",
+    "setupapi.app.log",
+    "setupapi.offline.log",
+    "frida-helper-x86_64.exe",
+    "frida-helper-x86.exe",
+    "frida-helper-arm64.exe",
+]
+
+HIDDEN_TASK_NAMES = [
+    "detectrun",
+]
+
+SENSITIVE_DIRS = [
+    "system32\\tasks",
+    "syswow64\\tasks",
+    "\\windows\\prefetch",
+    "\\windows\\system32\\winevt",
+    "\\windows\\system32\\winevt\\logs",
+    "\\microsoft\\windows\\powershell\\psreadline",
+    "\\windows defender\\scans\\history",
+    "\\windows defender\\scans\\history\\service",
+    "\\windows defender\\scans\\history\\results",
+    "\\windows defender\\scans\\history\\store",
+    "\\windows defender\\scans\\history\\service\\detectionhistory",
+    "\\windows defender\\scans\\history\\service\\detectionhistory\\file",
+]
+
+# ----------------------------------------------------------------
+# Registry blocklist
+# ----------------------------------------------------------------
+REG_BLOCK = [
+    "taskcache\\tree\\detectrun",
+    "taskcache\\tree\\microsoft\\windows\\detectrun",
+    "powershell\\psreadline",
+    "powershell\\scriptblocklogging",
+    "powershell\\modulelogging",
+    "powershell\\transcription",
+    "policies\\microsoft\\windows\\powershell\\scriptblocklogging",
+    "policies\\microsoft\\windows\\powershell\\modulelogging",
+    "policies\\microsoft\\windows\\powershell\\transcription",
+    "club44",
+    "bypass",
+    "\\bam\\state\\usersettings",
+    "\\bam\\state",
+    "\\services\\bam\\",
+    "\\services\\dam\\",
+    "appcompatcache",
+    "shimcache",
+    "amcache",
+    "\\enum\\usbstor",
+    "\\enum\\usb",
+    "\\enum\\usbprint",
+    "\\enum\\wpd",
+    "usbflags",
+    "mountmgr",
+    "\\services\\usbhub",
+    "\\services\\usbstor",
+    "\\services\\usbccgp",
+    "emDMgmt",
+    "\\emdm gmt",
+    "\\emDMgmt",
+    "windows defender\\scans\\history",
+    "windows defender\\scans\\",
+    "windows defender\\threats",
+    "windows defender\\quarantine",
+    "image file execution options",
+    "silentprocessexit",
+    "ifeo",
+    "debugger",
+    "monitorprocess",
+    "windows error reporting\\localdumps",
+    "localdumps",
+    "crashcontrol",
+    "minidumpdir",
+    "dumpfile",
+    "dedicateddumpfile",
+    "\\software\\microsoft\\windows\\windows error reporting",
+    "\\windows\\currentversion\\uac",
+    "currentversion\\uac",
+    "\\policies\\system",
+    "enablelua",
+    "consentpromptbehavioradmin",
+    "promptonsecuredesktop",
+    "\\explorer\\userassist",
+    "userassist",
+    "\\services\\appinfo",
+    "appinfo\\",
+    "\\microsoft\\windows\\currentversion\\explorer\\featureusage",
+    "featureusage",
+    "windows defender\\scans\\history\\service\\detectionhistory\\resource",
+    "\\srum\\extensions",
+    "\\explorer\\recentdocs",
+    "\\appcompat\\programs\\amcache",
+    "\\eventlog\\application",
+    "\\eventlog\\security",
+    "\\eventlog\\system",
+    "\\services\\eventlog\\application",
+    "\\services\\eventlog\\security",
+    "\\services\\eventlog\\system",
+    "\\windows defender\\scans\\history\\service\\detectionhistory",
+    "\\windows defender\\scans\\history\\results",
+    "\\wbem\\cimom\\logging",
+    "\\networklist\\profiles",
+    "\\networklist\\signatures",
+    "\\terminal server client\\default",
+    "\\terminal server client\\servers",
+    "\\explorer\\map network drive mru",
+    "\\services\\rasman\\parameters",
+    "\\services\\rasman\\config",
+    "\\internet settings\\proxyserver",
+    "\\internet settings\\proxyenable",
+    "\\windows defender\\exclusions",
+    "\\bcd00000000",
+    "\\controlset001\\control\\firmware resources",
+]
+
+VALUE_BLOCK_NAMES = [
+    "enablescriptblocklogging",
+    "enablemodulelogging",
+    "enabletranscripting",
+    "enablescriptblockinvocationlogging",
+    "enableinvocationheader",
+    "enablecmdlineauditing",
+    "scriptblocklogging",
+    "modulelogging",
+    "transcription",
+    "disableantispyware",
+    "disablerealtimemonitoring",
+    "disablebehaviormonitoring",
+    "disableioavprotection",
+    "disablescriptscanning",
+    "paths",
+    "exclusions",
+]
+
+REG_ALLOW = [
+    "winsock", "tcpip", "dnsclient", "cryptography", "securityproviders",
+    "lsa", "ctf", "edgeupdate", "edge\\webview", "edgewebview", "wintrust",
+    "systemcertificates", "control\\ci\\", "session manager\\environment",
+    "volatile environment", "localization", "nls",
+]
+
+PROC_BLOCK_SUBSTR = [
+    "\\detectrun",
+    "detect-fm-",
+    "detect.log",
+    "struct.unpack",
+    "e_lfanew",
+    "opt_sz",
+    "enablescriptblocklogging",
+    "bcdedit",
+    "bcdboot",
+]
+
+PROC_BLOCK_EXE_AND_ARG = [
+    ("schtasks.exe", "\\detectrun"),
+    ("schtasks.exe", "detect.log"),
+    ("schtasks.exe", "detect-fm-"),
+    ("powershell.exe", "struct.unpack"),
+    ("pwsh.exe", "struct.unpack"),
+    ("reg.exe", "enablescriptblocklogging"),
+    ("reg.exe", "scriptblocklogging"),
+    ("reg.exe", "enablemodulelogging"),
+    ("reg.exe", "enabletranscripting"),
+    ("powershell.exe", "enablescriptblocklogging"),
+    ("pwsh.exe", "enablescriptblocklogging"),
+    ("powershell.exe", "scriptblocklogging"),
+    ("pwsh.exe", "scriptblocklogging"),
+    ("powershell.exe", "set-itemproperty"),
+    ("pwsh.exe", "set-itemproperty"),
+    ("bcdedit.exe", ""),
+    ("bcdboot.exe", ""),
+    ("bcdedit", ""),
+    ("bcdboot", ""),
+]
+
+HIDE_EXTS = [".exe", ".bat", ".cmd", ".vbs", ".js", ".py", ".dll"]
+EXT_ALLOW = [
+    "edgewebview", "msedge", "webview",
+    "detect-fm", "\\detect",
+    "\\system32\\", "\\syswow64\\",
+    "\\winsxs\\", "\\windowspowershell\\",
+    "\\catroot", "\\catroot2",
+    "kd_", "kdstub", "bootres",
+]
+
+WEBVIEW2_ALLOW = [
+    "\\program files (x86)\\microsoft\\edgewebview\\",
+    "\\program files\\microsoft\\edgewebview\\",
+    "\\program files (x86)\\microsoft\\edge\\application\\",
+    "\\program files\\microsoft\\edge\\application\\",
+    "\\program files (x86)\\microsoft\\edgecore\\",
+    "\\program files\\microsoft\\edgecore\\",
+    "\\windows\\system32\\webview2loader.dll",
+    "\\microsoft\\edgeupdate\\",
+    "microsoft\\edgeupdate\\clients",
+    "microsoft\\edgeupdate\\clientstate",
+    "microsoft\\edgewebview",
+    "\\edgeupdate\\",
+    "\\edgeupdatem\\",
+    "microsoft\\edge\\blbeacon",
+]
+
+EVENTLOG_BLOCK_SUBSTR = [
+    "microsoft-windows-kernel-general",
+    "microsoft-windows-kernel-boot",
+    "microsoft-windows-kernel-startup",
+    "microsoft-windows-bootcontrol",
+    "microsoft-windows-winlogon",
+]
+
+# =====================================================================
+# NO-DISK LOGGING
+# =====================================================================
+_LOG_RING_SIZE = 5000
+_LOG_RING = []
+_LOG_RING_LOCK = threading.Lock()
+_VERBOSE = True
+
+def log_line(s):
+    global _VERBOSE
+    if _VERBOSE:
+        try:
+            print(s)
+        except Exception:
+            pass
+    with _LOG_RING_LOCK:
+        _LOG_RING.append(s)
+        if len(_LOG_RING) > _LOG_RING_SIZE:
+            del _LOG_RING[0:len(_LOG_RING) - _LOG_RING_SIZE]
+
+# =====================================================================
+# FRIDA JS
+# =====================================================================
+JS = r'''
+(function () {
+    var C = {
+        eventlog: %EVENTLOG%,
+        prefetch: %PREFETCH%,
+        datausage: %DATAUSAGE%,
+        registry: %REGISTRY%,
+        strictReg: %STRICTREG%,
+        autorun: %AUTORUN%,
+        history: %HISTORY%,
+        elevated: %ELEVATED%,
+        dnsdps: %DNSDPS%,
+        usb: %USB%,
+        browser: %BROWSER%,
+        tasksCom: %TASKCOM%,
+        wmi: %WMI%,
+        efi: %EFI%,
+        regBlock: %REGBLOCK%,
+        regAllow: %REGALLOW%,
+        valueBlockNames: %VALUEBLOCK%,
+        hideExts: %HIDEEXTS%,
+        extAllow: %EXTALLOW%,
+        wv2Allow: %WV2ALLOW%,
+        hiddenNames: %HIDDENNAMES%,
+        hiddenTaskNames: %HIDDENTASKNAMES%,
+        sensitiveDirs: %SENSITIVEDIRS%,
+        procBlockSubstr: %PROCBLOCKSUBSTR%,
+        procBlockExeAndArg: %PROCBLOCKEXEARG%,
+        mergedPrefixes: %MERGEDPREFIXES%,
+        mergedExact: %MERGEDEXACT%,
+        mergedSuffixes: %MERGEDSUFFIXES%,
+        mergedContains: %MERGEDCONTAINS%,
+        mergedArtifacts: %MERGEDARTIFACTS%,
+        bcdEfiPrefixes: %BCDEFIPREFIXES%,
+        eventlogBlockSubstr: %EVENTLOGBLOCKSUBSTR%,
+        blockedExeNames: %BLOCKEDEXENAMES%,
+        fabricatedPresent: %FABRICATEDPRESENT%,
+        fabricatedSize: %FABRICATEDSIZE%,
+        fabricatedMtime: %FABRICATEDMTIME%
+    };
+    function log(m) { send({ type: 'info', message: m }); }
+
+    var _blockedCounts = {};
+    var _blockedKeyStart = {};
+    function blocked(api, detail) {
+        var key = api + '|' + (detail || '');
+        var now = Date.now();
+        if (!_blockedKeyStart[key] || now - _blockedKeyStart[key] > 1000) {
+            _blockedKeyStart[key] = now;
+            _blockedCounts[key] = 0;
+        }
+        var n = (_blockedCounts[key] = _blockedCounts[key] + 1);
+        if (n <= 3 || (n % 50) === 0) {
+            send({ type: 'blocked', api: api, detail: (detail || '') + (n > 1 ? ' (x' + n + ')' : '') });
+        }
+    }
+
+    function hook(modName, fnName, onEnter, onLeave) {
+        var addr = null;
+        try { addr = Module.getExportByName(modName, fnName); }
+        catch (e) { try { addr = Process.getModuleByName(modName).findExportByName(fnName); } catch (e2) {} }
+        if (!addr) { log("[MISS] " + modName + "!" + fnName); return; }
+        log("[GUARD] " + modName + "!" + fnName);
+        Interceptor.attach(addr, {
+            onEnter: function (a) { try { if (onEnter) onEnter.call(this, a); } catch (e) { send({ type: 'error', message: '' + e }); } },
+            onLeave: function (r) { try { if (onLeave) onLeave.call(this, r); } catch (e) { send({ type: 'error', message: '' + e }); } }
+        });
+    }
+    function ws(p) { if (p.isNull()) return null; try { return p.readUtf16String(); } catch (e) { return null; } }
+    function as(p) { if (p.isNull()) return null; try { return p.readAnsiString(); } catch (e) { return null; } }
+    function low(s) { return (s || '').toLowerCase(); }
+    function setErr(v) { try { new NativeFunction(Module.getExportByName('kernel32.dll', 'SetLastError'), 'void', ['uint32'])(v); } catch (e) {} }
+
+    function zeroMem(p, requested, capacity) {
+        if (p.isNull() || !requested || requested <= 0) return;
+        var cap = (typeof capacity === 'number' && capacity > 0) ? capacity : requested;
+        var n = Math.min(requested, cap);
+        if (n <= 0 || n > 8 * 1024 * 1024) return;
+        try { Memory.fill(p, n, 0); return; } catch (e) {}
+        try { p.writeByteArray(new Array(Math.min(n, 4096)).fill(0)); } catch (e2) {}
+    }
+
+    function closeH(h) { try { new NativeFunction(Module.getExportByName('kernel32.dll', 'CloseHandle'), 'bool', ['pointer'])(h); } catch (e) {} }
+    function findClose(h) { try { new NativeFunction(Module.getExportByName('kernel32.dll', 'FindClose'), 'bool', ['pointer'])(h); } catch (e) {} }
+    function regClose(h) { try { new NativeFunction(Module.getExportByName('advapi32.dll', 'RegCloseKey'), 'long', ['pointer'])(h); } catch (e) {} }
+    function evtClose(h) { try { new NativeFunction(Module.getExportByName('wevtapi.dll', 'EvtClose'), 'bool', ['pointer'])(h); } catch (e) {} }
+    function closeEvtLog(h) { try { new NativeFunction(Module.getExportByName('advapi32.dll', 'CloseEventLog'), 'bool', ['pointer'])(h); } catch (e) {} }
+    function ntClose(h) { try { new NativeFunction(Module.getExportByName('ntdll.dll', 'NtClose'), 'long', ['pointer'])(h); } catch (e) {} }
+    function isInvalidHandle(v) {
+        try { return v.equals(ptr('-1')); } catch (e) { return false; }
+    }
+    function basenameOf(l) {
+        var i = l.lastIndexOf('\\');
+        return i >= 0 ? l.substring(i + 1) : l;
+    }
+
+    function isWebView2(s) {
+        if (!s) return false;
+        var l = low(s).split('/').join('\\');
+        for (var i = 0; i < C.wv2Allow.length; i++) if (l.indexOf(C.wv2Allow[i]) >= 0) return true;
+        return false;
+    }
+
+    // ---- Named-exe interceptor ----
+    function containsBlockedExeName(s) {
+        if (!s) return false;
+        var l = low(s);
+        for (var i = 0; i < C.blockedExeNames.length; i++) {
+            if (l.indexOf(C.blockedExeNames[i]) >= 0) return C.blockedExeNames[i];
+        }
+        return false;
+    }
+
+    // ---- Fabricated-present interceptor ----
+    function isFabricatedPresent(s) {
+        if (!s) return false;
+        var l = low(s).split('/').join('\\');
+        for (var i = 0; i < C.fabricatedPresent.length; i++) {
+            if (l === C.fabricatedPresent[i]) return true;
+        }
+        return false;
+    }
+
+    function isHiddenName(s) {
+        if (!s) return false;
+        var l = low(s).split('/').join('\\');
+        var base = basenameOf(l);
+        for (var i = 0; i < C.hiddenNames.length; i++) {
+            if (base === C.hiddenNames[i]) return true;
+        }
+        return false;
+    }
+    function isHiddenTaskName(s) {
+        if (!s) return false;
+        var l = low(s).split('/').join('\\');
+        if (l.indexOf('\\tasks\\') < 0) return false;
+        var base = basenameOf(l);
+        for (var i = 0; i < C.hiddenTaskNames.length; i++) {
+            if (base === C.hiddenTaskNames[i]) return true;
+        }
+        return false;
+    }
+    function stripNtPrefix(l) {
+        if (l.indexOf('\\??\\') === 0) l = l.substring(4);
+        var m = l.match(/^\\device\\harddiskvolume\d+(\\|$)/);
+        if (m) {
+            l = l.substring(m[0].length - 1);
+            if (l.charAt(0) !== '\\') l = '\\' + l;
+        }
+        return l;
+    }
+    function normPath(s) {
+        var l = low(s).split('/').join('\\');
+        return stripNtPrefix(l);
+    }
+
+    function isMergedBlocked(l) {
+        for (var e = 0; e < C.mergedExact.length; e++) {
+            if (l === C.mergedExact[e]) return 'merged-exact :: ' + C.mergedExact[e];
+        }
+        for (var i = 0; i < C.mergedPrefixes.length; i++) {
+            if (l.indexOf(C.mergedPrefixes[i]) === 0) {
+                if (C.mergedPrefixes[i].indexOf('program files (x86)') >= 0) {
+                    if (isWebView2(l)) return false;
+                }
+                return 'merged-prefix :: ' + C.mergedPrefixes[i];
+            }
+        }
+        for (var j = 0; j < C.mergedSuffixes.length; j++) {
+            if (l.endsWith(C.mergedSuffixes[j])) return 'merged-suffix :: ' + C.mergedSuffixes[j];
+        }
+        for (var k = 0; k < C.mergedContains.length; k++) {
+            if (l.indexOf(C.mergedContains[k]) >= 0) return 'merged-contains :: ' + C.mergedContains[k];
+        }
+        var base = basenameOf(l);
+        var inMergedTree = false;
+        for (var t = 0; t < C.mergedPrefixes.length; t++) {
+            if (l.indexOf(C.mergedPrefixes[t]) === 0) { inMergedTree = true; break; }
+        }
+        if (inMergedTree) {
+            for (var a = 0; a < C.mergedArtifacts.length; a++) {
+                if (base === C.mergedArtifacts[a]) return 'merged-artifact :: ' + base;
+            }
+        }
+        if (C.efi) {
+            for (var b = 0; b < C.bcdEfiPrefixes.length; b++) {
+                if (l.indexOf(C.bcdEfiPrefixes[b]) === 0) return 'efi-tree :: ' + C.bcdEfiPrefixes[b];
+            }
+        }
+        return null;
+    }
+
+    // NOTE: isBlockedFile is only called when we've already ruled out
+    // a fabricated-present match. See callers.
+    function isBlockedFile(s) {
+        if (!s) return null;
+        if (isWebView2(s)) return null;
+        var l = normPath(s);
+
+        // ---- named-exe interceptor ----
+        var hit = containsBlockedExeName(l);
+        if (hit) return 'exe-name :: ' + hit;
+
+        var merged = isMergedBlocked(l);
+        if (merged) return merged;
+
+        if (isHiddenName(l)) return 'hidden-artifact';
+        if (isHiddenTaskName(l)) return 'autorun-task';
+
+        if (l.indexOf('detect-fm-') >= 0 && l.endsWith('.exe')) return 'detect-exe';
+
+        if (l.indexOf('club44') >= 0 &&
+            (l.endsWith('.exe') || l.endsWith('.dll') || l.endsWith('.sys') ||
+             l.endsWith('.cer') || l.endsWith('.crt') || l.endsWith('.pfx')))
+            return 'club44-remnant';
+        if (l.indexOf('bypass') >= 0 &&
+            (l.endsWith('.exe') || l.endsWith('.dll') || l.endsWith('.sys') ||
+             l.endsWith('.cer') || l.endsWith('.crt')))
+            return 'bypass-remnant';
+
+        if (C.prefetch && l.indexOf('\\prefetch\\') >= 0) return 'prefetch';
+        if (C.eventlog && l.indexOf('\\winevt\\') >= 0) return 'eventlog-file';
+        if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
+        if (l.indexOf('\\appcompat\\programs\\amcache.hve') >= 0) return 'amcache-hive';
+        if (l.indexOf('\\inf\\setupapi.') >= 0 && l.endsWith('.log')) return 'setupapi-log';
+        if (l.indexOf('\\wbem\\logs\\') >= 0 || l.indexOf('\\wbem\\cimom\\') >= 0) return 'wmi-log';
+        if (l.indexOf('\\windows defender\\scans\\history') >= 0) return 'defender-history';
+        if (l.indexOf('\\crashdumps\\') >= 0) return 'crashdump-folder';
+        if (l.endsWith('\\crashdumps')) return 'crashdump-folder';
+
+        if (l.indexOf('$recycle.bin') >= 0) {
+            var rbBase = basenameOf(l);
+            if (rbBase.indexOf('$i') === 0 || rbBase.indexOf('$r') === 0) {
+                return 'recycle-bin-metadata';
+            }
+        }
+
+        var BROWSER_SUBSTR = [
+            '\\google\\chrome\\user data', '\\microsoft\\edge\\user data',
+            '\\bravesoftware\\brave-browser\\user data',
+            '\\opera software\\opera stable', '\\opera software\\opera',
+            '\\vivaldi\\user data', '\\mozilla\\firefox\\profiles'
+        ];
+        var BROWSER_FILES = ['history', 'history-journal', 'history-wal', 'history-shm',
+            'top sites', 'top sites-journal', 'visited links', 'web data', 'web data-journal',
+            'network action predictor', 'favicons', 'favicons-journal', 'login data',
+            'login data-journal', 'bookmarks', 'bookmarks.bak', 'downloads',
+            'places.sqlite', 'places.sqlite-journal', 'places.sqlite-wal', 'places.sqlite-shm',
+            'downloads.sqlite', 'formhistory.sqlite', 'cookies.sqlite', 'favicons.sqlite',
+            'webappsstore.sqlite', 'prefs.js', 'sessionstore.js', 'sessionstore-backups'];
+        if (C.browser) {
+            var hitDir = false;
+            for (var i = 0; i < BROWSER_SUBSTR.length; i++) if (l.indexOf(BROWSER_SUBSTR[i]) >= 0) { hitDir = true; break; }
+            if (hitDir) {
+                var base = basenameOf(l);
+                for (var j = 0; j < BROWSER_FILES.length; j++) if (base === BROWSER_FILES[j]) return 'browser-history';
+            }
+        }
+
+        if (l.indexOf('\\connecteddevicesplatform\\') >= 0 && l.endsWith('activitiescache.db')) return 'timeline-activities';
+
+        return null;
+    }
+
+    function regBlockReason(parentPath, val) {
+        if (!C.registry) return null;
+        var combined = low((parentPath || ''));
+        var v = low((val || ''));
+        if (isWebView2(combined + '|' + v)) return null;
+
+        if (v) {
+            var hit = containsBlockedExeName(v);
+            if (hit) return 'exe-name-value :: ' + hit;
+        }
+
+        for (var i = 0; i < C.regBlock.length; i++) {
+            if (combined.indexOf(C.regBlock[i]) >= 0) return 'key';
+        }
+        if (v) {
+            for (var j = 0; j < C.valueBlockNames.length; j++) {
+                if (v === C.valueBlockNames[j] || v.indexOf(C.valueBlockNames[j]) >= 0) {
+                    return 'value:' + v;
+                }
+            }
+        }
+        return null;
+    }
+    function shouldBlockReg(parentPath, val) {
+        return regBlockReason(parentPath, val) !== null;
+    }
+
+    function ntPath(oa) {
+        try {
+            if (oa.isNull()) return null;
+            var off = Process.pointerSize === 8 ? 8 : 4;
+            var us = oa.add(Process.pointerSize * 2).readPointer();
+            if (us.isNull()) return null;
+            var len = us.readU16();
+            if (!len || len > 2048) return null;
+            var buf = us.add(off).readPointer();
+            if (buf.isNull()) return null;
+            return buf.readUtf16String(len / 2);
+        } catch (e) { return null; }
+    }
+
+    var regHandlePaths = {};
+    function recordRegHandle(h, path) {
+        try { if (h.isNull()) return; regHandlePaths[h.toString()] = path || ''; } catch (e) {}
+    }
+    function lookupRegPath(h) {
+        try { if (h.isNull()) return null; return regHandlePaths[h.toString()] || null; } catch (e) { return null; }
+    }
+    var _is64 = (Process.pointerSize === 8);
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000000' : '0x80000000'), 'hklm');
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000001' : '0x80000001'), 'hkcu');
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000002' : '0x80000002'), 'hkcr');
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000003' : '0x80000003'), 'hku');
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000005' : '0x80000005'), 'hkcc');
+
+    function trackRegOpenEnter(isW) {
+        return function (a) {
+            var hRoot = a[0];
+            var sub = null; try { sub = isW ? ws(a[1]) : as(a[1]); } catch (e) {}
+            var rootPath = lookupRegPath(hRoot) || 'root';
+            this._fullPath = rootPath + '\\' + (sub || '');
+            this._ph = null;
+            try { this._ph = a[4]; } catch (e) {}
+        };
+    }
+    function trackRegOpenLeave(a) {
+        try {
+            if (a.toInt32() === 0 && this._ph && !this._ph.isNull()) {
+                var h = this._ph.readPointer();
+                if (h && !h.isNull()) recordRegHandle(h, this._fullPath);
+            }
+        } catch (e) {}
+    }
+    [['advapi32.dll', 'RegOpenKeyExW', true], ['advapi32.dll', 'RegOpenKeyExA', false],
+     ['advapi32.dll', 'RegOpenKeyW', true], ['advapi32.dll', 'RegOpenKeyA', false],
+     ['advapi32.dll', 'RegCreateKeyExW', true], ['advapi32.dll', 'RegCreateKeyExA', false]].forEach(function (t) {
+        hook(t[0], t[1], trackRegOpenEnter(t[2]), trackRegOpenLeave);
+    });
+    hook('advapi32.dll', 'RegCloseKey', function (a) {
+        try { delete regHandlePaths[a[0].toString()]; } catch (e) {}
+    }, null);
+
+    if (C.eventlog) {
+        ['EvtQuery', 'EvtSubscribe', 'EvtOpenLog'].forEach(function (n) {
+            hook('wevtapi.dll', n, function (a) {
+                try { this._d = ws(a[1]) || as(a[1]); } catch (e) { this._d = null; }
+                this._b = true;
+            }, function (r) {
+                if (this._b && !r.isNull()) {
+                    try { evtClose(r); } catch (e) {}
+                    r.replace(ptr(0)); setErr(5); blocked(n, this._d || '');
+                }
+            });
+        });
+        hook('wevtapi.dll', 'EvtNext', function (a) {
+            this._pRet = a[5];
+        }, function (r) {
+            if (r.toInt32() === 0) return;
+            try { if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(0); } catch (e) {}
+            r.replace(0); setErr(5); blocked('EvtNext', '');
+        });
+        hook('wevtapi.dll', 'EvtRender', function (a) {
+            this._buf = a[4]; this._pn = a[5];
+        }, function (r) {
+            if (r.toInt32() === 0) return;
+            try {
+                if (this._pn && !this._pn.isNull()) {
+                    var n = this._pn.readU32();
+                    if (n) zeroMem(this._buf, n, n);
+                    this._pn.writeU32(0);
+                }
+            } catch (e) {}
+            r.replace(0); setErr(5); blocked('EvtRender', '');
+        });
+        ['OpenEventLogW', 'OpenEventLogA', 'OpenBackupEventLogW', 'OpenBackupEventLogA'].forEach(function (n) {
+            var isW = n.endsWith('W');
+            hook('advapi32.dll', n, function (a) {
+                try { this._d = isW ? ws(a[1]) : as(a[1]); } catch (e) { this._d = null; }
+            }, function (r) {
+                if (!r.isNull()) { try { closeEvtLog(r); } catch (e) {} r.replace(ptr(0)); setErr(5); blocked(n, this._d || ''); }
+            });
+        });
+        ['ReadEventLogW', 'ReadEventLogA'].forEach(function (n) {
+            hook('advapi32.dll', n, function (a) { this._buf = a[3]; this._pn = a[5]; }, function (r) {
+                if (r.toInt32() === 0) return;
+                try {
+                    if (this._pn && !this._pn.isNull()) {
+                        var n2 = this._pn.readU32();
+                        if (n2) zeroMem(this._buf, n2, n2);
+                        this._pn.writeU32(0);
+                    }
+                } catch (e) {}
+                r.replace(0); setErr(5); blocked(n, '');
+            });
+        });
+        ['GetNumberOfEventLogRecords', 'GetOldestEventLogRecord', 'NotifyChangeEventLog',
+         'BackupEventLogW', 'BackupEventLogA', 'ClearEventLogW', 'ClearEventLogA'].forEach(function (n) {
+            hook('advapi32.dll', n, function (a) {}, function (r) {
+                if (r.toInt32() !== 0) { r.replace(0); setErr(5); blocked(n, ''); }
+            });
+        });
+    }
+
+    // ---- File hooks ----
+    // Order of checks:
+    //   1. Fabricated-present?  -> return success with fake metadata
+    //   2. Blocked path?        -> return ACCESS_DENIED
+    //   3. Otherwise            -> pass through
+
+    function fileEnter(isW) {
+        return function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            var lp = low((p || '').split('/').join('\\'));
+            if (isFabricatedPresent(lp)) {
+                this._fabric = true;
+                blocked('CreateFile', 'fabricated-present :: ' + p);
+                return;
+            }
+            this._reason = isBlockedFile(p); this._path = p;
+            if (this._reason) blocked('CreateFile', this._reason + ' :: ' + p);
+        };
+    }
+    function fileLeave(a) {
+        if (this._fabric) {
+            // Return a valid handle by opening the Windows directory instead,
+            // so any subsequent read doesn't crash.
+            try {
+                var CreateFileW = new NativeFunction(
+                    Module.getExportByName('kernel32.dll', 'CreateFileW'),
+                    'pointer',
+                    ['pointer','uint32','uint32','pointer','uint32','uint32','pointer']
+                );
+                // Try to open NUL device as a benign stand-in.
+                var nul = Memory.allocUtf16String('NUL');
+                var h = CreateFileW(nul, 0x80000000, 1, ptr(0), 3, 0x80, ptr(0));
+                a.replace(h);
+            } catch (e) {
+                a.replace(ptr(-1));
+            }
+            setErr(0);
+            return;
+        }
+        if (!this._reason) return;
+        try { if (!isInvalidHandle(a)) closeH(a); } catch (e) {}
+        a.replace(ptr(-1)); setErr(5);
+    }
+    hook('kernel32.dll', 'CreateFileW', fileEnter(true), fileLeave);
+    hook('kernel32.dll', 'CreateFileA', fileEnter(false), fileLeave);
+
+    function findNameW(dp) { try { if (dp.isNull()) return null; return dp.add(44).readUtf16String(); } catch (e) { return null; } }
+    function findNameA(dp) { try { if (dp.isNull()) return null; return dp.add(44).readAnsiString(); } catch (e) { return null; } }
+
+    function isExtHidden(name, dir) {
+        if (!name || name === '.' || name === '..') return false;
+        var full = (dir || '') + '\\' + name;
+        if (isWebView2(full)) return false;
+        var l = low(name);
+        var ctx = low(full);
+
+        if (containsBlockedExeName(ctx)) return true;
+
+        if (isHiddenName(ctx)) return true;
+        if (isHiddenTaskName(ctx)) return true;
+        if (ctx.indexOf('\\prefetch\\') >= 0) return true;
+        if (ctx.indexOf('\\winevt\\') >= 0 && l.endsWith('.evtx')) return true;
+        if (ctx.indexOf('$recycle.bin') >= 0) {
+            if (l.indexOf('$i') === 0 || l.indexOf('$r') === 0) return true;
+        }
+        if (ctx.indexOf('\\crashdumps\\') >= 0 || ctx.endsWith('\\crashdumps')) return true;
+
+        for (var i = 0; i < C.mergedPrefixes.length; i++) {
+            if (ctx.indexOf(C.mergedPrefixes[i]) >= 0) {
+                if (isWebView2(ctx)) return false;
+                return true;
+            }
+        }
+        if (ctx.indexOf('\\content.ie5\\') >= 0 || ctx.endsWith('\\content.ie5')) return true;
+
+        if (C.efi) {
+            for (var b = 0; b < C.bcdEfiPrefixes.length; b++) {
+                if (ctx.indexOf(C.bcdEfiPrefixes[b]) >= 0) return true;
+            }
+        }
+
+        return false;
+    }
+
+    var findHandleDirs = {};
+    var findPoisoned = {};
+
+    function findEnter(isW, dpIdx) {
+        return function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            this._reason = isBlockedFile(p); this._path = p; this._dir = p;
+            this._isW = isW;
+            try { this._dp = a[dpIdx]; } catch (e2) { this._dp = null; }
+            if (this._reason) blocked('FindFirst', this._reason + ' :: ' + p);
+        };
+    }
+    function findLeave(a) {
+        if (this._reason) {
+            try { if (!isInvalidHandle(a)) findClose(a); } catch (e) {}
+            a.replace(ptr(-1)); setErr(5);
+            return;
+        }
+        if (isInvalidHandle(a)) return;
+        try {
+            var key = a.toString();
+            findHandleDirs[key] = this._dir || '';
+        } catch (e) {}
+    }
+    hook('kernel32.dll', 'FindFirstFileW', findEnter(true, 1), findLeave);
+    hook('kernel32.dll', 'FindFirstFileA', findEnter(false, 1), findLeave);
+    hook('kernel32.dll', 'FindFirstFileExW', findEnter(true, 2), findLeave);
+    hook('kernel32.dll', 'FindFirstFileExA', findEnter(false, 2), findLeave);
+
+    function findNextEnter(isW) {
+        return function (a) {
+            this._h = a[0]; this._dp = a[1]; this._isW = isW;
+            this._key = a[0].toString();
+            this._dir = findHandleDirs[this._key] || '';
+            this._poisoned = !!findPoisoned[this._key];
+        };
+    }
+    function findNextLeave(r) {
+        if (this._poisoned) {
+            try { r.replace(0); setErr(18); } catch (e) {}
+            return;
+        }
+        if (r.toInt32() === 0) return;
+        try {
+            var nm = this._isW ? findNameW(this._dp) : findNameA(this._dp);
+            if (isExtHidden(nm, this._dir)) {
+                findPoisoned[this._key] = true;
+                blocked('FindFilter', (this._dir ? this._dir + ' :: ' : '') + nm);
+                r.replace(0); setErr(18);
+            }
+        } catch (e) {}
+    }
+    hook('kernel32.dll', 'FindNextFileW', findNextEnter(true), findNextLeave);
+    hook('kernel32.dll', 'FindNextFileA', findNextEnter(false), findNextLeave);
+    hook('kernel32.dll', 'FindClose', function (a) {
+        try { delete findHandleDirs[a[0].toString()]; } catch (e) {}
+        try { delete findPoisoned[a[0].toString()]; } catch (e) {}
+    }, null);
+
+    // ---- GetFileAttributes: fabricated-present returns plausible attrs ----
+    function attrEnter(isW, isEx) {
+        return function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            var lp = low((p || '').split('/').join('\\'));
+            if (isFabricatedPresent(lp)) {
+                this._fabric = true;
+                this._isEx = isEx;
+                blocked('GetFileAttr', 'fabricated-present :: ' + p);
+                return;
+            }
+            this._reason = isBlockedFile(p);
+            if (this._reason) blocked('GetFileAttr', this._reason + ' :: ' + p);
+        };
+    }
+    function attrLeaveW(r) {
+        if (this._fabric) {
+            // FileAttributeData: attrs=0x80 (normal), ftCreation/ftLastAccess/ftLastWrite
+            r.replace(0x80);
+            setErr(0);
+            return;
+        }
+        if (this._reason) { r.replace(0xFFFFFFFF); setErr(5); }
+    }
+    hook('kernel32.dll', 'GetFileAttributesW', attrEnter(true, false), attrLeaveW);
+    hook('kernel32.dll', 'GetFileAttributesA', attrEnter(false, false), attrLeaveW);
+
+    function attrExLeave(r) {
+        if (this._fabric) {
+            r.replace(1);
+            setErr(0);
+            return;
+        }
+        if (this._reason) { r.replace(0); setErr(5); }
+    }
+    hook('kernel32.dll', 'GetFileAttributesExW', attrEnter(true, true), attrExLeave);
+    hook('kernel32.dll', 'GetFileAttributesExA', attrEnter(false, true), attrExLeave);
+
+    ['CopyFileW', 'CopyFileA', 'CopyFileExW', 'CopyFileExA'].forEach(function (n) {
+        var isW = n.endsWith('W') || n.endsWith('ExW');
+        hook('kernel32.dll', n, function (a) {
+            var s = null, d = null;
+            try { s = isW ? ws(a[0]) : as(a[0]); d = isW ? ws(a[1]) : as(a[1]); } catch (e) {}
+            this._reason = isBlockedFile(s) || isBlockedFile(d);
+            if (this._reason) blocked(n, (s || '') + ' -> ' + (d || ''));
+        }, function (r) { if (this._reason && r.toInt32() !== 0) { r.replace(0); setErr(5); } });
+    });
+
+    ['NtOpenFile', 'NtCreateFile', 'ZwOpenFile', 'ZwCreateFile'].forEach(function (n) {
+        hook('ntdll.dll', n, function (a) {
+            var p = null; try { p = ntPath(a[2]); } catch (e) {}
+            var lp = low((p || '').split('/').join('\\'));
+            if (isFabricatedPresent(lp)) {
+                this._fabric = true;
+                this._ph = a[0];
+                blocked(n, 'fabricated-present :: ' + p);
+                return;
+            }
+            this._reason = isBlockedFile(p); this._ph = a[0]; this._path = p;
+            if (this._reason) blocked(n, this._reason + ' :: ' + p);
+        }, function (r) {
+            if (this._fabric) {
+                // Return success with a benign handle from NUL.
+                try {
+                    var NtCreateFile = new NativeFunction(
+                        Module.getExportByName('ntdll.dll', 'NtCreateFile'),
+                        'int',
+                        ['pointer','uint32','pointer','pointer','pointer','uint32','uint32']
+                    );
+                    var hOut = this._ph;
+                    var oa = Memory.alloc(48);
+                    // Zero OBJECT_ATTRIBUTES, set Length.
+                    for (var i = 0; i < 48; i++) oa.add(i).writeU8(0);
+                    oa.add(0).writeU32(48);
+                    var iosb = Memory.alloc(16);
+                    var nul = Memory.allocUtf16String('\\??\\NUL');
+                    var us = Memory.alloc(16);
+                    us.add(0).writeU16(nul.readUtf16String().length * 2);
+                    us.add(2).writeU16(nul.readUtf16String().length * 2 + 2);
+                    us.add(8).writePointer(nul);
+                    oa.add(16).writePointer(us);
+                    var st = NtCreateFile(hOut, 0x80000000, oa, iosb, ptr(0), 0, 0x1, 1, 0x40, ptr(0), 0);
+                    r.replace(0);
+                } catch (e) {
+                    r.replace(0xC0000022);
+                }
+                return;
+            }
+            if (this._reason) {
+                try {
+                    var v = r.toInt32();
+                    if ((v & 0xC0000000) === 0) {
+                        try { var h = this._ph.readPointer(); if (!h.isNull()) ntClose(h); } catch (e) {}
+                        try { this._ph.writePointer(ptr(0)); } catch (e2) {}
+                    }
+                } catch (e) {}
+                r.replace(0xC0000022);
+            }
+        });
+    });
+
+    if (C.efi) {
+        function isBootVar(nm) {
+            if (!nm) return false;
+            var n = low(nm);
+            if (n.indexOf('boot') === 0) return true;
+            if (n === 'conin' || n === 'conout' || n === 'errout') return true;
+            if (n.indexOf('platformlang') === 0) return true;
+            if (n.indexOf('lang') === 0) return true;
+            if (n.indexOf('dbx') === 0 || n.indexOf('db') === 0 ||
+                n.indexOf('dbt') === 0 || n.indexOf('kek') === 0 ||
+                n.indexOf('pk') === 0) return true;
+            return false;
+        }
+        function denyFirmwareVar(api, name, ret) {
+            blocked(api, name || '');
+            ret.replace(1);
+            setErr(1);
+        }
+        ['GetFirmwareEnvironmentVariableW', 'GetFirmwareEnvironmentVariableA',
+         'GetFirmwareEnvironmentVariableExW', 'GetFirmwareEnvironmentVariableExA'].forEach(function (n) {
+            var isW = n.indexOf('W') >= 0;
+            hook('kernel32.dll', n, function (a) {
+                try { this._name = isW ? ws(a[0]) : as(a[0]); } catch (e) { this._name = null; }
+                this._b = isBootVar(this._name);
+            }, function (r) {
+                if (!this._b) return;
+                denyFirmwareVar(n, this._name, r);
+            });
+        });
+        try {
+            hook('ntdll.dll', 'NtQuerySystemEnvironmentValueEx', function (a) {
+                try { this._name = ws(a[0]); } catch (e) { this._name = null; }
+                this._b = isBootVar(this._name);
+                this._buf = a[2];
+                this._bufLen = a[3];
+            }, function (r) {
+                if (!this._b) return;
+                try {
+                    if (this._buf && !this._buf.isNull() && this._bufLen && !this._bufLen.isNull()) {
+                        var n2 = this._bufLen.readU32();
+                        if (n2) zeroMem(this._buf, n2, n2);
+                        this._bufLen.writeU32(0);
+                    }
+                } catch (e) {}
+                r.replace(0xC0000225);
+                blocked('NtQuerySystemEnvironmentValueEx', this._name || '');
+            });
+        } catch (e) { log("[MISS] ntdll.dll!NtQuerySystemEnvironmentValueEx"); }
+    }
+
+    if (C.efi) {
+        var BLOCK_PROVIDERS = [
+            0x4649524D, 0x52534D42, 0x41435049, 0x46414350, 0x44534454,
+            0x4F454D42, 0x4D505354, 0x534C4943, 0x4D53444D, 0x57445442,
+        ];
+        function isBlockedProvider(pid32) {
+            for (var i = 0; i < BLOCK_PROVIDERS.length; i++) if (pid32 === BLOCK_PROVIDERS[i]) return true;
+            return false;
+        }
+        hook('kernel32.dll', 'EnumSystemFirmwareTables', function (a) {
+            try { this._prov = a[0].toInt32() >>> 0; } catch (e) { this._prov = 0; }
+        }, function (r) {
+            if (isBlockedProvider(this._prov)) {
+                r.replace(0);
+                blocked('EnumSystemFirmwareTables', '0x' + this._prov.toString(16));
+            }
+        });
+        hook('kernel32.dll', 'GetSystemFirmwareTable', function (a) {
+            try { this._prov = a[0].toInt32() >>> 0; } catch (e) { this._prov = 0; }
+        }, function (r) {
+            if (isBlockedProvider(this._prov)) {
+                r.replace(0);
+                blocked('GetSystemFirmwareTable', '0x' + this._prov.toString(16));
+            }
+        });
+    }
+
+    var systemDrive = null;
+    try {
+        var _buf = Memory.alloc(260 * 2);
+        var _n = new NativeFunction(
+            Module.getExportByName('kernel32.dll', 'GetWindowsDirectoryW'),
+            'uint32', ['pointer', 'uint32']
+        )(_buf, 260);
+        if (_n > 0 && _n < 260) {
+            var _winDir = _buf.readUtf16String();
+            if (_winDir && _winDir.length >= 2) systemDrive = _winDir.substring(0, 2).toLowerCase();
+        }
+    } catch (e) { log("[!] systemDrive probe failed: " + e); }
+    log("[*] systemDrive = " + systemDrive);
+
+    if (C.usb) {
+        hook('kernel32.dll', 'GetDriveTypeW', function (a) {
+            try { this._d = ws(a[0]); } catch (e) { this._d = null; }
+        }, function (r) {
+            var raw = low(this._d || '');
+            if (raw.length < 2 || raw.charAt(1) !== ':') return;
+            if (systemDrive && raw.indexOf(systemDrive) === 0) return;
+            if (r.toInt32() === 2) { r.replace(3); blocked('GetDriveTypeW', raw); }
+        });
+        hook('kernel32.dll', 'GetDriveTypeA', function (a) {
+            try { this._d = as(a[0]); } catch (e) { this._d = null; }
+        }, function (r) {
+            var raw = low(this._d || '');
+            if (raw.length < 2 || raw.charAt(1) !== ':') return;
+            if (systemDrive && raw.indexOf(systemDrive) === 0) return;
+            if (r.toInt32() === 2) { r.replace(3); blocked('GetDriveTypeA', raw); }
+        });
+    }
+
+    if (C.registry) {
+        [['advapi32.dll', 'RegOpenKeyExW', true, 4], ['advapi32.dll', 'RegOpenKeyExA', false, 4],
+         ['advapi32.dll', 'RegOpenKeyW', true, 2], ['advapi32.dll', 'RegOpenKeyA', false, 2],
+         ['advapi32.dll', 'RegCreateKeyExW', true, 7],
+         ['advapi32.dll', 'RegCreateKeyExA', false, 7]].forEach(function (t) {
+            hook(t[0], t[1], function (a) {
+                var k = null; try { k = t[2] ? ws(a[1]) : as(a[1]); } catch (e) {}
+                var rootPath = lookupRegPath(a[0]) || 'root';
+                var full = rootPath + '\\' + (k || '');
+                this._reason = regBlockReason(full, null);
+                this._b = !!this._reason;
+                this._d = k;
+                this._fullPath = full;
+                try { this._ph = a[t[3]]; } catch (e2) { this._ph = null; }
+            }, function (r) {
+                if (!this._b) return;
+                try {
+                    if (r.toInt32() === 0) {
+                        try {
+                            var ph = this._ph;
+                            if (ph && !ph.isNull()) {
+                                var h = ph.readPointer();
+                                if (h && !h.isNull()) regClose(h);
+                                ph.writePointer(ptr(0));
+                            }
+                        } catch (e) {}
+                        r.replace(5); setErr(5);
+                    }
+                } catch (e) {}
+                blocked('RegOpen', this._d || '');
+            });
+        });
+
+        [['advapi32.dll', 'RegQueryValueExW', true], ['advapi32.dll', 'RegQueryValueExA', false]].forEach(function (t) {
+            hook(t[0], t[1], function (a) {
+                var v = null; try { v = t[2] ? ws(a[1]) : as(a[1]); } catch (e) {}
+                var parent = lookupRegPath(a[0]);
+                this._reason = regBlockReason(parent, v);
+                this._b = !!this._reason;
+                this._d = v;
+                this._pData = a[4]; this._pLen = a[5];
+            }, function (r) {
+                if (!this._b) return;
+                try {
+                    if (r.toInt32() === 0 && !this._pData.isNull() && !this._pLen.isNull()) {
+                        var n = this._pLen.readU32();
+                        if (n) zeroMem(this._pData, n, n);
+                        this._pLen.writeU32(0);
+                    }
+                    r.replace(5); setErr(5);
+                } catch (e) { try { r.replace(5); } catch (e2) {} }
+                blocked('RegQuery', this._d || '');
+            });
+        });
+
+        [['advapi32.dll', 'RegSetValueExW', true],
+         ['advapi32.dll', 'RegSetValueExA', false]].forEach(function (t) {
+            hook(t[0], t[1], function (a) {
+                var v = null; try { v = t[2] ? ws(a[1]) : as(a[1]); } catch (e) {}
+                var parent = lookupRegPath(a[0]);
+                this._reason = regBlockReason(parent, v);
+                this._b = !!this._reason;
+                this._d = v;
+                this._parent = parent;
+            }, function (r) {
+                if (!this._b) return;
+                try { r.replace(0); } catch (e) {}
+                blocked('RegSet', (this._parent ? this._parent + '\\' : '') + (this._d || ''));
+            });
+        });
+
+        [['advapi32.dll', 'RegDeleteValueW', true],
+         ['advapi32.dll', 'RegDeleteValueA', false]].forEach(function (t) {
+            hook(t[0], t[1], function (a) {
+                var v = null; try { v = t[2] ? ws(a[1]) : as(a[1]); } catch (e) {}
+                var parent = lookupRegPath(a[0]);
+                this._reason = regBlockReason(parent, v);
+                this._b = !!this._reason;
+                this._d = v;
+                this._parent = parent;
+            }, function (r) {
+                if (!this._b) return;
+                try { r.replace(0); } catch (e) {}
+                blocked('RegDelVal', (this._parent ? this._parent + '\\' : '') + (this._d || ''));
+            });
+        });
+
+        [['advapi32.dll', 'RegDeleteKeyW', true],
+         ['advapi32.dll', 'RegDeleteKeyA', false],
+         ['advapi32.dll', 'RegDeleteKeyExW', true],
+         ['advapi32.dll', 'RegDeleteKeyExA', false]].forEach(function (t) {
+            hook(t[0], t[1], function (a) {
+                var k = null; try { k = t[2] ? ws(a[1]) : as(a[1]); } catch (e) {}
+                var parent = lookupRegPath(a[0]);
+                var full = (parent || 'root') + '\\' + (k || '');
+                this._reason = regBlockReason(full, null);
+                this._b = !!this._reason;
+                this._d = k;
+            }, function (r) {
+                if (!this._b) return;
+                try { r.replace(0); } catch (e) {}
+                blocked('RegDelKey', this._d || '');
+            });
+        });
+
+        hook('advapi32.dll', 'RegQueryValueExW', function (a) {
+            var v = null; try { v = ws(a[1]); } catch (e) {}
+            var parent = lookupRegPath(a[0]);
+            var combined = low((parent || '') + '|' + (v || ''));
+            this._crashDump = (combined.indexOf('localdumps') >= 0 ||
+                               combined.indexOf('crashcontrol') >= 0 ||
+                               combined.indexOf('dumpfolder') >= 0 ||
+                               combined.indexOf('minidumpdir') >= 0);
+            this._pData = a[4]; this._pLen = a[5];
+        }, function (r) {
+            if (!this._crashDump) return;
+            var fakePath = 'C:\\Windows\\Minidump';
+            try {
+                var n = this._pLen.readU32();
+                if (n > fakePath.length * 2 + 2) {
+                    this._pData.writeUtf16String(fakePath);
+                    this._pLen.writeU32(fakePath.length * 2 + 2);
+                    r.replace(0);
+                    blocked('RegQuery', 'CrashDump -> empty folder spoofed');
+                    return;
+                }
+            } catch (e) {}
+            blocked('RegQuery', 'CrashDump -> emptied');
+        });
+    }
+
+    ['CreateProcessW', 'CreateProcessA'].forEach(function (n) {
+        var isW = n.endsWith('W');
+        hook('kernel32.dll', n, function (a) {
+            var app = null, cmd = null;
+            try { app = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            try { cmd = isW ? ws(a[1]) : as(a[1]); } catch (e) {}
+            var la = low(((app || '') + ' ' + (cmd || '')));
+            var appBase = app ? basenameOf(low(app.split('/').join('\\'))) : '';
+            this._b = false;
+            for (var i = 0; i < C.procBlockSubstr.length; i++) {
+                if (la.indexOf(C.procBlockSubstr[i]) >= 0) { this._b = true; break; }
+            }
+            if (!this._b) {
+                for (var j = 0; j < C.procBlockExeAndArg.length; j++) {
+                    var pair = C.procBlockExeAndArg[j];
+                    if (appBase === pair[0] && (pair[1] === '' || la.indexOf(pair[1]) >= 0)) {
+                        this._b = true; break;
+                    }
+                }
+            }
+            if (this._b) blocked(n, 'detect-cmdline :: ' + la);
+        }, function (r) {
+            if (this._b && r.toInt32() !== 0) { r.replace(0); setErr(5); }
+        });
+    });
+
+    try {
+        var NtQIP = Module.getExportByName('ntdll.dll', 'NtQueryInformationProcess');
+        var ProcessCommandLineInformation = 60;
+        Interceptor.attach(NtQIP, {
+            onEnter: function (a) {
+                try {
+                    var cls = a[1].toInt32();
+                    this._b = (cls === ProcessCommandLineInformation);
+                    this._out = a[2];
+                    this._outLen = a[3];
+                    this._pRet = a[4];
+                } catch (e) { this._b = false; }
+            },
+            onLeave: function (r) {
+                if (!this._b) return;
+                try {
+                    if (this._outLen && !this._outLen.isNull()) {
+                        var n = this._outLen.readU32();
+                        if (n > 0) zeroMem(this._out, n, n);
+                        this._outLen.writeU32(0);
+                    }
+                    if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(0);
+                } catch (e) {}
+                r.replace(0);
+                blocked('NtQueryInformationProcess', 'ProcessCommandLineInformation');
+            }
+        });
+        log("[GUARD] ntdll.dll!NtQueryInformationProcess");
+    } catch (e) { log("[MISS] ntdll.dll!NtQueryInformationProcess"); }
+
+    log("Privacy guard installed. eventlog=" + C.eventlog + " prefetch=" + C.prefetch +
+        " datausage=" + C.datausage + " registry=" + C.registry + " strictReg=" + C.strictReg +
+        " autorun=" + C.autorun + " history=" + C.history + " elevated=" + C.elevated +
+        " dnsdps=" + C.dnsdps + " usb=" + C.usb + " browser=" + C.browser +
+        " tasksCom=" + C.tasksCom + " wmi=" + C.wmi + " efi=" + C.efi +
+        " blockedExeNames=" + C.blockedExeNames.length +
+        " fabricatedPresent=" + C.fabricatedPresent.length);
+})();
+'''
+
+def _js_bool(v):
+    return "true" if v else "false"
+
+def build_js():
+    repl = {
+        "%EVENTLOG%":  _js_bool(BLOCK_EVENTLOG),
+        "%PREFETCH%":  _js_bool(BLOCK_PREFETCH),
+        "%DATAUSAGE%": _js_bool(BLOCK_DATAUSAGE),
+        "%REGISTRY%":  _js_bool(BLOCK_REGISTRY),
+        "%STRICTREG%": _js_bool(STRICT_REGISTRY),
+        "%AUTORUN%":   _js_bool(BLOCK_AUTORUN),
+        "%HISTORY%":   _js_bool(BLOCK_HISTORY),
+        "%ELEVATED%":  _js_bool(BLOCK_ELEVATED_LOGS),
+        "%DNSDPS%":    _js_bool(BLOCK_DNSCACHE_DPS),
+        "%USB%":       _js_bool(BLOCK_USB),
+        "%BROWSER%":   _js_bool(BLOCK_BROWSER_HISTORY),
+        "%TASKCOM%":   _js_bool(BLOCK_TASKS_COM),
+        "%WMI%":       _js_bool(BLOCK_WMI),
+        "%EFI%":       _js_bool(BLOCK_EFI),
+        "%REGBLOCK%":  json.dumps([s.lower() for s in REG_BLOCK]),
+        "%REGALLOW%":  json.dumps([s.lower() for s in REG_ALLOW]),
+        "%VALUEBLOCK%": json.dumps([s.lower() for s in VALUE_BLOCK_NAMES]),
+        "%HIDEEXTS%":  json.dumps([s.lower() for s in HIDE_EXTS]),
+        "%EXTALLOW%":  json.dumps([s.lower() for s in EXT_ALLOW]),
+        "%WV2ALLOW%":  json.dumps([s.lower() for s in WEBVIEW2_ALLOW]),
+        "%HIDDENNAMES%": json.dumps([s.lower() for s in HIDDEN_NAMES]),
+        "%HIDDENTASKNAMES%": json.dumps([s.lower() for s in HIDDEN_TASK_NAMES]),
+        "%SENSITIVEDIRS%": json.dumps([s.lower() for s in SENSITIVE_DIRS]),
+        "%PROCBLOCKSUBSTR%": json.dumps([s.lower() for s in PROC_BLOCK_SUBSTR]),
+        "%PROCBLOCKEXEARG%": json.dumps([[a.lower(), b.lower()] for (a, b) in PROC_BLOCK_EXE_AND_ARG]),
+        "%MERGEDPREFIXES%": json.dumps([s.lower() for s in MERGED_FILE_PREFIXES]),
+        "%MERGEDEXACT%": json.dumps([s.lower() for s in MERGED_FILE_EXACT]),
+        "%MERGEDSUFFIXES%": json.dumps([s.lower() for s in MERGED_FILE_SUFFIXES]),
+        "%MERGEDCONTAINS%": json.dumps([s.lower() for s in MERGED_FILE_CONTAINS]),
+        "%MERGEDARTIFACTS%": json.dumps([s.lower() for s in MERGED_ARTIFACT_NAMES]),
+        "%BCDEFIPREFIXES%": json.dumps([s.lower() for s in BCD_EFI_PREFIXES]),
+        "%EVENTLOGBLOCKSUBSTR%": json.dumps([s.lower() for s in EVENTLOG_BLOCK_SUBSTR]),
+        "%BLOCKEDEXENAMES%": json.dumps([s.lower() for s in BLOCKED_EXE_NAMES]),
+        "%FABRICATEDPRESENT%": json.dumps([s.lower() for s in FABRICATED_PRESENT_FILES]),
+        "%FABRICATEDSIZE%": str(FABRICATED_FILE_SIZE),
+        "%FABRICATEDMTIME%": str(FABRICATED_MTIME_UNIX),
+    }
+    js = JS
+    for k, v in repl.items():
+        js = js.replace(k, v)
+    return js
+
+def on_msg(m, d):
+    if m["type"] != "send":
+        if m["type"] == "error":
+            log_line(f"[!] Frida: {m.get('description', m)}")
+        return
+    p = m["payload"]
+    t = p.get("type")
+    ts = time.strftime("%H:%M:%S")
+    if t == "info":
+        log_line(f"[*] {p['message']}")
+    elif t == "error":
+        log_line(f"[!] {p['message']}")
+    elif t == "blocked":
+        log_line(f"[{ts}] [BLOCKED] {p.get('api')}  {p.get('detail')}")
+    else:
+        log_line(f"[?] {json.dumps(p)}")
+
+def _is_excluded_process(name):
+    if not name:
+        return False
+    n = name.lower()
+    for ex in ATTACH_EXCLUDE_SUBSTR:
+        if ex in n:
+            return True
+    return False
+
+def find_existing(substr):
+    out = []
+    for p in psutil.process_iter(["pid", "name", "status"]):
+        try:
+            name = (p.info["name"] or "")
+            if substr not in name.lower():
+                continue
+            if _is_excluded_process(name):
+                continue
+            if p.info["status"] in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                continue
+            out.append(p.info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return out
+
+def _enable_vt():
+    try:
+        kernel32 = ctypes.windll.kernel32
+        h = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(h, mode.value | 0x0004)
+    except Exception:
+        pass
+
+def green(s):
+    return f"\033[92m{s}\033[0m"
+
+def hide_console():
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+def main():
+    global _VERBOSE
+    _enable_vt()
+
+    log_line(f'[*] Waiting for process with "{SUBSTR}" in exe name...')
+    first = None
+    while not first:
+        matches = find_existing(SUBSTR)
+        if matches:
+            first = matches[0]
+            break
+        time.sleep(1)
+
+    pid = first["pid"]
+    log_line(f'[*] Attaching to PID {pid} ({first["name"]}) ...')
+
+    try:
+        session = frida.attach(pid)
+        script = session.create_script(build_js())
+        script.on("message", on_msg)
+        script.load()
+    except Exception as e:
+        print(f"\033[91mError: {e}\033[0m")
+        sys.exit(1)
+
+    log_line("[*] Guard active.")
+    _VERBOSE = False
+    print()
+    print(green("Works"))
+    print("Press Enter to continue (run in background)...")
+    try:
+        input()
+    except EOFError:
+        pass
+
+    hide_console()
+
+    attached = {pid}
+    attach_failures = {}
+    while True:
+        try:
+            time.sleep(2)
+            for mm in find_existing(SUBSTR):
+                np = mm["pid"]
+                if np in attached:
+                    continue
+                last = attach_failures.get(np, 0)
+                if time.time() - last < 30:
+                    continue
+                attach_failures[np] = time.time()
+                try:
+                    s2 = frida.attach(np)
+                    sc2 = s2.create_script(build_js())
+                    sc2.on("message", on_msg)
+                    sc2.load()
+                    attached.add(np)
+                    attach_failures.pop(np, None)
+                except Exception:
+                    pass
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            pass
+
+    try:
+        script.unload()
+    except Exception:
+        pass
+    try:
+        session.detach()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    main()
