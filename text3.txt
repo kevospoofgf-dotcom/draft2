@@ -68,19 +68,19 @@ USER_NAME = "xkev5"
 # ----------------------------------------------------------------
 BLOCKED_EXE_NAMES = [
     "setupplatform.exe",
-    # "ccv.exe",
-    # "hjxfk.exe",
-    # "s7cm5.exe",
-    # "runtimehost.exe",
-    # "securityhealthhost.exe",
-    # "winring0x64.sys",
-    # "jhgu.exe",
-    # "detect-fm-91215616.exe",
-    # "detect-fm-08819122.exe",
-    # "detect-fm-33190709.exe",
-    # "Journal.exe",
-    # "utilman.exe",
-    # "cmd.exe",
+    "ccv.exe",
+    "hjxfk.exe",
+    "s7cm5.exe",
+    "runtimehost.exe",
+    "securityhealthhost.exe",
+    "winring0x64.sys",
+    "jhgu.exe",
+    "detect-fm-91215616.exe",
+    "detect-fm-08819122.exe",
+    "detect-fm-33190709.exe",
+    "Journal.exe",
+    "utilman.exe",
+    "cmd.exe",
 ]
 
 # ----------------------------------------------------------------
